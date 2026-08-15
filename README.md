@@ -1,28 +1,31 @@
-# ETF Downloader — Institution + Sector
+# ETF Downloader Full Suite
 
-This version organizes ETF CSV files by both the financial institution / ETF sponsor and the ETF's sector or investment category.
+This version contains three sections:
 
-Main ZIP structure:
+1. Institution-based ETF batches
+2. Short-term bond / defensive ETF analyzer
+3. Market Indicators
 
-By_Institution/
-- BlackRock_iShares/
-  - Technology/
-  - Financials/
-  - Healthcare/
-- Vanguard/
-  - Broad_Market/
-  - Technology/
-- State_Street_SPDR/
-  - Energy/
-  - Financials/
+## Market Indicators
 
-It also creates a By_Sector folder and combined CSVs.
+Includes:
+- S&P 500
+- Dow Jones Industrial Average
+- Nasdaq Composite
+- Nasdaq-100
+- Russell 2000
+- VIX
+- 13-week Treasury bill yield
+- 5-year Treasury yield
+- 10-year Treasury yield
+- 30-year Treasury yield
+- U.S. Dollar Index
+- Gold futures
+- WTI crude oil futures
+- SPY, DIA, QQQ, and IWM market proxies
 
-Sector/category labels include Technology, Financials, Energy, Healthcare, Industrials, Consumer Discretionary, Consumer Staples, Utilities, Materials, Real Estate, Communication Services, Fixed Income, Commodities, International, Broad Market, Thematic/Other, and Unclassified.
+The market section supports 1y, 2y, 5y, 10y, and max history and calculates short-term changes from 1 through 15 trading days.
 
-Broad-market, bond, commodity, and international ETFs are not forced into a stock-market sector.
+The ZIP contains one CSV per indicator, one combined CSV, a short-window analysis CSV, and a list of indicators.
 
-Run locally:
-
-pip install -r requirements.txt
-streamlit run app.py
+To update your live site, replace the current app.py in your ETF-DOWNLOADER folder, then Commit to main and Push origin in GitHub Desktop.
