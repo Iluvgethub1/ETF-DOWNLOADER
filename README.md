@@ -1,6 +1,19 @@
 # ETF Downloader — Intervals + Custom Date Ranges + Automatic Daily Snapshot
 
-This version adds exact historical date-range selection.
+This version adds one-click historical year blocks plus exact custom date ranges.
+
+### Easy year blocks
+Choose **Year block**, then choose 1, 2, 3, 5, or 10 years per block.
+- Block 1 = most recent block
+- Block 2 = immediately preceding block
+- Block 3 = the block before that
+
+Example with 2-year blocks on August 15, 2026:
+- Block 1: Aug 15, 2024 → Aug 15, 2026
+- Block 2: Aug 15, 2022 → Aug 15, 2024
+- Block 3: Aug 15, 2020 → Aug 15, 2022
+
+You do not need to type dates unless you choose Custom date range.
 
 For each major section you can choose:
 

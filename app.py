@@ -5,6 +5,7 @@ import re
 import time
 import zipfile
 from datetime import date
+from dateutil.relativedelta import relativedelta
 
 import pandas as pd
 import requests
@@ -209,7 +210,7 @@ def interval_period_picker(prefix, default_interval="Daily (1d)"):
 
     range_mode = st.radio(
         "Date selection",
-        ["Recent period", "Custom date range"],
+        ["Recent period", "Year block", "Custom date range"],
         horizontal=True,
         key=f"{prefix}_range_mode",
     )
@@ -234,7 +235,41 @@ def interval_period_picker(prefix, default_interval="Daily (1d)"):
         )
 
     today = date.today()
-    default_start = today.replace(year=max(today.year - 2, 1970))
+
+    if range_mode == "Year block":
+        block_years = st.selectbox(
+            "Years per block",
+            [1, 2, 3, 5, 10],
+            index=1,
+            key=f"{prefix}_block_years",
+            help="Choose how many years each historical block should contain.",
+        )
+        block_number = st.number_input(
+            "Historical block",
+            min_value=1,
+            max_value=20,
+            value=1,
+            step=1,
+            key=f"{prefix}_block_number",
+            help="Block 1 is the most recent block. Block 2 is the block immediately before it, and so on.",
+        )
+        end_date = today - relativedelta(years=block_years * (int(block_number) - 1))
+        start_date = end_date - relativedelta(years=block_years)
+        st.info(
+            f"Block {int(block_number)}: {start_date.isoformat()} through {end_date.isoformat()} "
+            f"({block_years} year{'s' if block_years != 1 else ''})"
+        )
+        return (
+            interval_choice,
+            settings["interval"],
+            None,
+            settings["label"],
+            start_date,
+            end_date,
+            "custom",
+        )
+
+    default_start = today - relativedelta(years=2)
     start_date = st.date_input(
         "Start date",
         value=default_start,
@@ -261,8 +296,13 @@ def interval_period_picker(prefix, default_interval="Daily (1d)"):
 
 def download_chunk(chunk_df, period, interval, start_date=None, end_date=None, range_mode="period"):
     tickers = chunk_df["YahooTicker"].tolist()
-    raw = yf.download(
-        tickers=tickers,
+    # Download smaller internal groups for better reliability on older ranges.
+    raw_parts = []
+    internal_size = 20
+    for internal_start in range(0, len(tickers), internal_size):
+        internal_tickers = tickers[internal_start:internal_start + internal_size]
+        part = yf.download(
+        tickers=internal_tickers,
         interval=interval,
         auto_adjust=False,
         actions=False,
