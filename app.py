@@ -31,6 +31,11 @@ st.caption(
     "The optional GitHub Actions files in this update can also create a daily automatic snapshot."
 )
 
+st.caption(
+    "Custom date ranges are best for Daily data. Older intraday ranges may return no data "
+    "if Yahoo Finance does not provide that interval that far back."
+)
+
 ISSUER_PATTERNS = [
     ("BlackRock_iShares", [r"\biShares\b", r"\bBlackRock\b"]),
     ("Vanguard", [r"\bVanguard\b"]),
@@ -174,6 +179,20 @@ INTERVAL_SETTINGS = {
     },
 }
 
+
+def yf_time_kwargs(period, start_date, end_date, range_mode):
+    if range_mode == "custom":
+        return {
+            "start": str(start_date),
+            "end": str(end_date),
+        }
+    return {"period": period}
+
+def history_label(period, start_date, end_date, range_mode):
+    if range_mode == "custom":
+        return f"{start_date}_to_{end_date}"
+    return str(period)
+
 def interval_period_picker(prefix, default_interval="Daily (1d)"):
     interval_choice = st.selectbox(
         "Data interval",
@@ -185,22 +204,65 @@ def interval_period_picker(prefix, default_interval="Daily (1d)"):
             "choices because upstream intraday history is more limited."
         ),
     )
-    settings = INTERVAL_SETTINGS[interval_choice]
-    periods = settings["periods"]
-    default_period = settings["default_period"]
-    period = st.selectbox(
-        "History to include",
-        periods,
-        index=periods.index(default_period) if default_period in periods else 0,
-        key=f"{prefix}_period_choice",
-    )
-    return interval_choice, settings["interval"], period, settings["label"]
 
-def download_chunk(chunk_df, period, interval):
+    settings = INTERVAL_SETTINGS[interval_choice]
+
+    range_mode = st.radio(
+        "Date selection",
+        ["Recent period", "Custom date range"],
+        horizontal=True,
+        key=f"{prefix}_range_mode",
+    )
+
+    if range_mode == "Recent period":
+        periods = settings["periods"]
+        default_period = settings["default_period"]
+        period = st.selectbox(
+            "History to include",
+            periods,
+            index=periods.index(default_period) if default_period in periods else 0,
+            key=f"{prefix}_period_choice",
+        )
+        return (
+            interval_choice,
+            settings["interval"],
+            period,
+            settings["label"],
+            None,
+            None,
+            "period",
+        )
+
+    today = date.today()
+    default_start = today.replace(year=max(today.year - 2, 1970))
+    start_date = st.date_input(
+        "Start date",
+        value=default_start,
+        key=f"{prefix}_start_date",
+    )
+    end_date = st.date_input(
+        "End date",
+        value=today,
+        key=f"{prefix}_end_date",
+    )
+
+    if start_date >= end_date:
+        st.warning("Start date must be earlier than end date.")
+
+    return (
+        interval_choice,
+        settings["interval"],
+        None,
+        settings["label"],
+        start_date,
+        end_date,
+        "custom",
+    )
+
+def download_chunk(chunk_df, period, interval, start_date=None, end_date=None, range_mode="period"):
     tickers = chunk_df["YahooTicker"].tolist()
     raw = yf.download(
         tickers=tickers,
-        period=period,
         interval=interval,
         auto_adjust=False,
         actions=False,
@@ -208,6 +270,7 @@ def download_chunk(chunk_df, period, interval):
         threads=True,
         progress=False,
         timeout=30,
+        **yf_time_kwargs(period, start_date, end_date, range_mode),
     )
 
     meta = chunk_df.set_index("YahooTicker")
@@ -227,12 +290,12 @@ def download_chunk(chunk_df, period, interval):
             try:
                 retry = yf.download(
                     ticker,
-                    period=period,
                     interval=interval,
                     auto_adjust=False,
                     actions=False,
                     progress=False,
                     timeout=20,
+                    **yf_time_kwargs(period, start_date, end_date, range_mode),
                 )
                 one = normalize(retry, ticker, row)
             except Exception:
@@ -326,7 +389,15 @@ institution = st.selectbox(
     index=0,
 )
 
-interval_choice, data_interval, period, interval_label = interval_period_picker(
+(
+    interval_choice,
+    data_interval,
+    period,
+    interval_label,
+    institution_start,
+    institution_end,
+    institution_range_mode,
+) = interval_period_picker(
     "institution",
     default_interval="Daily (1d)"
 )
@@ -401,7 +472,7 @@ if st.button("Build institution batch ZIP", type="primary", use_container_width=
                 f"Downloading {institution} — request chunk {i} of {len(request_chunks)}..."
             )
             try:
-                got, failed = download_chunk(chunk, period, data_interval)
+                got, failed = download_chunk(chunk, period, data_interval, institution_start, institution_end, institution_range_mode)
             except Exception:
                 got, failed = {}, chunk["YahooTicker"].tolist()
 
@@ -439,7 +510,7 @@ if st.button("Build institution batch ZIP", type="primary", use_container_width=
                 data=bundle,
                 file_name=(
                     f"{institution_label}_ETF_BATCH_{batch_number:02d}_OF_"
-                    f"{total_batches:02d}_{stamp}_{period}_{safe_name(interval_label)}.zip"
+                    f"{total_batches:02d}_{stamp}_{safe_name(history_label(period, institution_start, institution_end, institution_range_mode))}_{safe_name(interval_label)}.zip"
                 ),
                 mime="application/zip",
                 type="primary",
@@ -480,7 +551,15 @@ bond_group = st.selectbox(
     key="bond_group"
 )
 
-bond_interval_choice, bond_interval, bond_history, bond_interval_label = interval_period_picker(
+(
+    bond_interval_choice,
+    bond_interval,
+    bond_history,
+    bond_interval_label,
+    bond_start,
+    bond_end,
+    bond_range_mode,
+) = interval_period_picker(
     "bond",
     default_interval="Daily (1d)"
 )
@@ -527,10 +606,9 @@ selected_windows = st.multiselect(
     key="bond_windows"
 )
 
-def download_bond_history(tickers, period, interval):
+def download_bond_history(tickers, period, interval, start_date=None, end_date=None, range_mode="period"):
     raw = yf.download(
         tickers=tickers,
-        period=period,
         interval=interval,
         auto_adjust=False,
         actions=False,
@@ -538,6 +616,7 @@ def download_bond_history(tickers, period, interval):
         threads=True,
         progress=False,
         timeout=30,
+        **yf_time_kwargs(period, start_date, end_date, range_mode),
     )
     out = {}
     for ticker in tickers:
@@ -646,7 +725,7 @@ def make_bond_zip(results, stats_df, group_name, history_period):
 
 if st.button("Build short-term bond ZIP + analysis", type="primary", use_container_width=True, key="bond_build"):
     with st.spinner("Downloading bond ETF history and calculating short holding periods..."):
-        bond_results = download_bond_history(bond_tickers, bond_history, bond_interval)
+        bond_results = download_bond_history(bond_tickers, bond_history, bond_interval, bond_start, bond_end, bond_range_mode)
 
         stats_frames = []
         if bond_interval == "1d":
@@ -712,7 +791,7 @@ if "bond_results" in st.session_state:
         st.download_button(
             "🗜️ Download short-term bond ETF ZIP",
             data=bond_zip,
-            file_name=f"SHORT_TERM_BOND_ETFS_{safe_group}_{stamp}_{bond_history_used}.zip",
+            file_name=f"SHORT_TERM_BOND_ETFS_{safe_group}_{stamp}_{safe_name(history_label(bond_history, bond_start, bond_end, bond_range_mode))}.zip",
             mime="application/zip",
             type="primary",
             use_container_width=True,
@@ -770,7 +849,15 @@ indicator_groups = st.multiselect(
     key="indicator_groups"
 )
 
-indicator_interval_choice, indicator_interval, indicator_history, indicator_interval_label = interval_period_picker(
+(
+    indicator_interval_choice,
+    indicator_interval,
+    indicator_history,
+    indicator_interval_label,
+    indicator_start,
+    indicator_end,
+    indicator_range_mode,
+) = interval_period_picker(
     "indicator",
     default_interval="Daily (1d)"
 )
@@ -801,13 +888,12 @@ indicator_windows = st.multiselect(
     key="indicator_windows"
 )
 
-def download_indicator_history(tickers, period, interval):
+def download_indicator_history(tickers, period, interval, start_date=None, end_date=None, range_mode="period"):
     if not tickers:
         return {}
 
     raw = yf.download(
         tickers=tickers,
-        period=period,
         interval=interval,
         auto_adjust=False,
         actions=False,
@@ -815,6 +901,7 @@ def download_indicator_history(tickers, period, interval):
         threads=True,
         progress=False,
         timeout=30,
+        **yf_time_kwargs(period, start_date, end_date, range_mode),
     )
 
     results = {}
@@ -968,7 +1055,10 @@ if st.button(
             indicator_results = download_indicator_history(
                 indicator_tickers,
                 indicator_history,
-                indicator_interval
+                indicator_interval,
+                indicator_start,
+                indicator_end,
+                indicator_range_mode,
             )
 
             stats_frames = []
@@ -1045,7 +1135,7 @@ if "indicator_results" in st.session_state:
             "🗜️ Download market indicators ZIP",
             data=indicator_zip,
             file_name=(
-                f"MARKET_INDICATORS_{stamp}_{indicator_history_used}.zip"
+                f"MARKET_INDICATORS_{stamp}_{safe_name(history_label(indicator_history, indicator_start, indicator_end, indicator_range_mode))}.zip"
             ),
             mime="application/zip",
             type="primary",

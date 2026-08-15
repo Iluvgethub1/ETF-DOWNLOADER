@@ -1,41 +1,45 @@
-# ETF Downloader — Intervals + Automatic Daily Snapshot
+# ETF Downloader — Intervals + Custom Date Ranges + Automatic Daily Snapshot
 
-This update keeps the ETF institution batches, short-term bond analyzer, and market indicators.
+This version adds exact historical date-range selection.
 
-## New manual data intervals
+For each major section you can choose:
 
-The Streamlit site now lets you choose:
+- **Recent period** — examples: 2y, 5y, 10y, max
+- **Custom date range** — choose an exact Start Date and End Date
 
-- Daily (1d)
-- Hourly (1h)
-- 30 minute (30m)
-- 15 minute (15m)
+Example:
 
-Daily data offers the longest history choices. Intraday choices intentionally use shorter lookback options.
+- First download: 2024-08-15 to 2026-08-15
+- Previous two years: 2022-08-15 to 2024-08-15
+- Earlier two years: 2020-08-15 to 2022-08-15
 
-The short 1-to-15-trading-day statistical analysis is calculated only when Daily (1d) is selected. Intraday selections still export the raw CSV files.
+This works especially well for Daily data.
 
-## Optional automatic daily snapshot
+Intraday data (Hourly, 30-minute, 15-minute) is subject to the upstream provider's historical intraday limits. Choosing an old custom range does not guarantee Yahoo Finance will provide that older intraday history.
 
-This package also contains:
+The package still includes:
+- Institution-based ETF batches
+- Short-term bond / defensive analyzer
+- Market indicators
+- Daily / Hourly / 30-minute / 15-minute interval choices
+- Optional automatic weekday snapshots through GitHub Actions
 
-- `auto_download.py`
-- `auto_tickers.txt`
-- `.github/workflows/daily_market_update.yml`
+## Update your live site
 
-When those files are pushed to GitHub, GitHub Actions can run on weekdays after the U.S. market closes. It downloads a small daily snapshot for the tickers listed in `auto_tickers.txt` and saves a ZIP in `daily_exports/`.
+Copy all files and folders into the root of your existing `ETF-DOWNLOADER` repository.
 
-You can edit `auto_tickers.txt` whenever you want to change the automatic list.
+Replace the old:
+- app.py
+- README.md
+- requirements.txt
 
-The workflow keeps only the most recent 45 automatic ZIP snapshots to reduce repository growth.
+Keep/add:
+- auto_download.py
+- auto_tickers.txt
+- .github/workflows/daily_market_update.yml
 
-## Updating your existing site
+Then in GitHub Desktop:
+1. Commit to main
+2. Push origin
 
-Copy all files/folders from this update into the root of your existing `ETF-DOWNLOADER` repository. Replace the old `app.py`, `README.md`, and `requirements.txt`. Keep the new `.github/workflows` folder, `auto_download.py`, and `auto_tickers.txt`.
-
-Then use GitHub Desktop:
-
-1. Commit the changes to `main`.
-2. Push origin.
-
-Streamlit should redeploy automatically. GitHub Actions may ask you to enable Actions for the repository the first time.
+Streamlit should redeploy automatically.
