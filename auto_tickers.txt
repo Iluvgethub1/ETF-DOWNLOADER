@@ -1,0 +1,14 @@
+# Put the tickers you want automatically updated once per trading day here.
+# You can edit this file later.
+SPY
+QQQ
+DIA
+IWM
+BIL
+SGOV
+SHY
+^GSPC
+^DJI
+^IXIC
+^VIX
+^TNX

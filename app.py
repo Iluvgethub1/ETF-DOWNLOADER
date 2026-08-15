@@ -26,6 +26,11 @@ st.write(
     "to hit memory or rate limits."
 )
 
+st.caption(
+    "You can now choose Daily, Hourly, 30-minute, or 15-minute bars. "
+    "The optional GitHub Actions files in this update can also create a daily automatic snapshot."
+)
+
 ISSUER_PATTERNS = [
     ("BlackRock_iShares", [r"\biShares\b", r"\bBlackRock\b"]),
     ("Vanguard", [r"\bVanguard\b"]),
@@ -141,12 +146,62 @@ def normalize(df, ticker, meta):
 def safe_name(value):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("_") or "Unknown"
 
-def download_chunk(chunk_df, period):
+
+INTERVAL_SETTINGS = {
+    "Daily (1d)": {
+        "interval": "1d",
+        "periods": ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"],
+        "default_period": "10y",
+        "label": "daily",
+    },
+    "Hourly (1h)": {
+        "interval": "1h",
+        "periods": ["5d", "1mo", "3mo", "6mo", "1y", "2y"],
+        "default_period": "1mo",
+        "label": "hourly",
+    },
+    "30 minute (30m)": {
+        "interval": "30m",
+        "periods": ["5d", "1mo"],
+        "default_period": "1mo",
+        "label": "30-minute",
+    },
+    "15 minute (15m)": {
+        "interval": "15m",
+        "periods": ["5d", "1mo"],
+        "default_period": "5d",
+        "label": "15-minute",
+    },
+}
+
+def interval_period_picker(prefix, default_interval="Daily (1d)"):
+    interval_choice = st.selectbox(
+        "Data interval",
+        list(INTERVAL_SETTINGS.keys()),
+        index=list(INTERVAL_SETTINGS.keys()).index(default_interval),
+        key=f"{prefix}_interval_choice",
+        help=(
+            "Daily is best for long histories. Intraday data uses shorter lookback "
+            "choices because upstream intraday history is more limited."
+        ),
+    )
+    settings = INTERVAL_SETTINGS[interval_choice]
+    periods = settings["periods"]
+    default_period = settings["default_period"]
+    period = st.selectbox(
+        "History to include",
+        periods,
+        index=periods.index(default_period) if default_period in periods else 0,
+        key=f"{prefix}_period_choice",
+    )
+    return interval_choice, settings["interval"], period, settings["label"]
+
+def download_chunk(chunk_df, period, interval):
     tickers = chunk_df["YahooTicker"].tolist()
     raw = yf.download(
         tickers=tickers,
         period=period,
-        interval="1d",
+        interval=interval,
         auto_adjust=False,
         actions=False,
         group_by="column",
@@ -173,7 +228,7 @@ def download_chunk(chunk_df, period):
                 retry = yf.download(
                     ticker,
                     period=period,
-                    interval="1d",
+                    interval=interval,
                     auto_adjust=False,
                     actions=False,
                     progress=False,
@@ -271,10 +326,9 @@ institution = st.selectbox(
     index=0,
 )
 
-period = st.selectbox(
-    "Daily history",
-    ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"],
-    index=7,
+interval_choice, data_interval, period, interval_label = interval_period_picker(
+    "institution",
+    default_interval="Daily (1d)"
 )
 
 batch_size = st.select_slider(
@@ -347,7 +401,7 @@ if st.button("Build institution batch ZIP", type="primary", use_container_width=
                 f"Downloading {institution} — request chunk {i} of {len(request_chunks)}..."
             )
             try:
-                got, failed = download_chunk(chunk, period)
+                got, failed = download_chunk(chunk, period, data_interval)
             except Exception:
                 got, failed = {}, chunk["YahooTicker"].tolist()
 
@@ -385,7 +439,7 @@ if st.button("Build institution batch ZIP", type="primary", use_container_width=
                 data=bundle,
                 file_name=(
                     f"{institution_label}_ETF_BATCH_{batch_number:02d}_OF_"
-                    f"{total_batches:02d}_{stamp}_{period}.zip"
+                    f"{total_batches:02d}_{stamp}_{period}_{safe_name(interval_label)}.zip"
                 ),
                 mime="application/zip",
                 type="primary",
@@ -426,11 +480,9 @@ bond_group = st.selectbox(
     key="bond_group"
 )
 
-bond_history = st.selectbox(
-    "Historical data to download for analysis",
-    ["1y", "2y", "5y", "10y", "max"],
-    index=2,
-    key="bond_history"
+bond_interval_choice, bond_interval, bond_history, bond_interval_label = interval_period_picker(
+    "bond",
+    default_interval="Daily (1d)"
 )
 
 if bond_group == "All Short-Term Defensive Groups":
@@ -475,11 +527,11 @@ selected_windows = st.multiselect(
     key="bond_windows"
 )
 
-def download_bond_history(tickers, period):
+def download_bond_history(tickers, period, interval):
     raw = yf.download(
         tickers=tickers,
         period=period,
-        interval="1d",
+        interval=interval,
         auto_adjust=False,
         actions=False,
         group_by="column",
@@ -594,13 +646,19 @@ def make_bond_zip(results, stats_df, group_name, history_period):
 
 if st.button("Build short-term bond ZIP + analysis", type="primary", use_container_width=True, key="bond_build"):
     with st.spinner("Downloading bond ETF history and calculating short holding periods..."):
-        bond_results = download_bond_history(bond_tickers, bond_history)
+        bond_results = download_bond_history(bond_tickers, bond_history, bond_interval)
 
         stats_frames = []
-        for ticker, df in bond_results.items():
-            stats = short_window_stats(df, ticker, selected_windows)
-            if not stats.empty:
-                stats_frames.append(stats)
+        if bond_interval == "1d":
+            for ticker, df in bond_results.items():
+                stats = short_window_stats(df, ticker, selected_windows)
+                if not stats.empty:
+                    stats_frames.append(stats)
+        else:
+            st.info(
+                "Short holding-period return analysis is calculated only for Daily (1d) data. "
+                "Your intraday CSV files will still be downloaded."
+            )
 
         stats_df = pd.concat(stats_frames, ignore_index=True) if stats_frames else pd.DataFrame()
 
@@ -712,11 +770,9 @@ indicator_groups = st.multiselect(
     key="indicator_groups"
 )
 
-indicator_history = st.selectbox(
-    "Historical data for market indicators",
-    ["1y", "2y", "5y", "10y", "max"],
-    index=2,
-    key="indicator_history"
+indicator_interval_choice, indicator_interval, indicator_history, indicator_interval_label = interval_period_picker(
+    "indicator",
+    default_interval="Daily (1d)"
 )
 
 indicator_tickers = []
@@ -745,14 +801,14 @@ indicator_windows = st.multiselect(
     key="indicator_windows"
 )
 
-def download_indicator_history(tickers, period):
+def download_indicator_history(tickers, period, interval):
     if not tickers:
         return {}
 
     raw = yf.download(
         tickers=tickers,
         period=period,
-        interval="1d",
+        interval=interval,
         auto_adjust=False,
         actions=False,
         group_by="column",
@@ -911,19 +967,26 @@ if st.button(
         ):
             indicator_results = download_indicator_history(
                 indicator_tickers,
-                indicator_history
+                indicator_history,
+                indicator_interval
             )
 
             stats_frames = []
-            for ticker, df in indicator_results.items():
-                stats = indicator_short_window_stats(
-                    df,
-                    ticker,
-                    indicator_names.get(ticker, ticker),
-                    indicator_windows
+            if indicator_interval == "1d":
+                for ticker, df in indicator_results.items():
+                    stats = indicator_short_window_stats(
+                        df,
+                        ticker,
+                        indicator_names.get(ticker, ticker),
+                        indicator_windows
+                    )
+                    if not stats.empty:
+                        stats_frames.append(stats)
+            else:
+                st.info(
+                    "Short-window percentage analysis is calculated only for Daily (1d) data. "
+                    "Your intraday market-indicator CSV files will still be downloaded."
                 )
-                if not stats.empty:
-                    stats_frames.append(stats)
 
             indicator_stats = (
                 pd.concat(stats_frames, ignore_index=True)
