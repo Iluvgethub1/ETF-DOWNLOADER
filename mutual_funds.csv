@@ -1,0 +1,14 @@
+symbol,fund_name,institution,category
+VFIAX,Vanguard 500 Index Fund Admiral Shares,Vanguard,Large Blend
+VTSAX,Vanguard Total Stock Market Index Fund Admiral Shares,Vanguard,Large Blend
+VBTLX,Vanguard Total Bond Market Index Fund Admiral Shares,Vanguard,Intermediate Core Bond
+VIGAX,Vanguard Growth Index Fund Admiral Shares,Vanguard,Large Growth
+VVIAX,Vanguard Value Index Fund Admiral Shares,Vanguard,Large Value
+FXAIX,Fidelity 500 Index Fund,Fidelity,Large Blend
+FSKAX,Fidelity Total Market Index Fund,Fidelity,Large Blend
+FTBFX,Fidelity Total Bond Fund,Fidelity,Intermediate Core-Plus Bond
+SWPPX,Schwab S&P 500 Index Fund,Charles Schwab,Large Blend
+SWTSX,Schwab Total Stock Market Index Fund,Charles Schwab,Large Blend
+TRBCX,T. Rowe Price Blue Chip Growth Fund,T. Rowe Price,Large Growth
+DODGX,Dodge & Cox Stock Fund,Dodge & Cox,Large Value
+AGTHX,American Funds Growth Fund of America Class A,Capital Group / American Funds,Large Growth

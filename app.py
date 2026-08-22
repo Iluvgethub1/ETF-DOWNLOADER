@@ -1,1217 +1,440 @@
+from __future__ import annotations
 
 import io
 import math
 import re
-import time
 import zipfile
-from datetime import date
-from dateutil.relativedelta import relativedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
-import requests
 import streamlit as st
 import yfinance as yf
 
+
 st.set_page_config(
-    page_title="Batched ETF Downloader",
-    page_icon="📦",
+    page_title="Batched Mutual Fund Downloader",
+    page_icon="📥",
     layout="wide",
 )
 
-NASDAQ_LISTED = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
-OTHER_LISTED = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
+DB_FILENAME = "mutual_funds.csv"
+MAX_WORKERS = 6
 
-st.title("📦 Batched ETF Downloader")
-st.write(
-    "Download large ETF universes in smaller ZIP batches so the app is less likely "
-    "to hit memory or rate limits."
-)
 
-st.caption(
-    "You can now choose Daily, Hourly, 30-minute, or 15-minute bars. "
-    "The optional GitHub Actions files in this update can also create a daily automatic snapshot."
-)
+def clean_text(v) -> str:
+    if pd.isna(v):
+        return ""
+    return str(v).strip()
 
-st.caption(
-    "Custom date ranges are best for Daily data. Older intraday ranges may return no data "
-    "if Yahoo Finance does not provide that interval that far back."
-)
 
-ISSUER_PATTERNS = [
-    ("BlackRock_iShares", [r"\biShares\b", r"\bBlackRock\b"]),
-    ("Vanguard", [r"\bVanguard\b"]),
-    ("State_Street_SPDR", [r"\bSPDR\b", r"\bState Street\b"]),
-    ("Invesco", [r"\bInvesco\b", r"\bPowerShares\b"]),
-    ("Charles_Schwab", [r"\bSchwab\b"]),
-    ("Fidelity", [r"\bFidelity\b"]),
-    ("JPMorgan", [r"\bJPMorgan\b", r"\bJ\.P\. Morgan\b", r"\bJPM\b"]),
-    ("Goldman_Sachs", [r"\bGoldman Sachs\b"]),
-    ("Franklin_Templeton", [r"\bFranklin\b", r"\bTempleton\b"]),
-    ("PIMCO", [r"\bPIMCO\b"]),
-    ("First_Trust", [r"\bFirst Trust\b"]),
-    ("ProShares", [r"\bProShares\b"]),
-    ("Direxion", [r"\bDirexion\b"]),
-    ("Global_X", [r"\bGlobal X\b"]),
-    ("VanEck", [r"\bVanEck\b"]),
-    ("WisdomTree", [r"\bWisdomTree\b"]),
-    ("ARK_Invest", [r"\bARK\b"]),
-    ("Innovator", [r"\bInnovator\b"]),
-    ("Amplify", [r"\bAmplify\b"]),
-    ("Simplify", [r"\bSimplify\b"]),
-    ("Roundhill", [r"\bRoundhill\b"]),
-    ("Defiance", [r"\bDefiance\b"]),
-    ("Janus_Henderson", [r"\bJanus Henderson\b"]),
-    ("PGIM", [r"\bPGIM\b"]),
-    ("YieldMax", [r"\bYieldMax\b"]),
-]
-
-SECTOR_PATTERNS = [
-    ("Technology", [r"technology", r"\btech\b", r"semiconductor", r"software", r"cyber", r"cloud", r"artificial intelligence", r"robot"]),
-    ("Financials", [r"financial", r"bank", r"insurance", r"capital markets", r"fintech"]),
-    ("Energy", [r"\benergy\b", r"\boil\b", r"\bgas\b", r"midstream", r"pipeline", r"uranium"]),
-    ("Healthcare", [r"health", r"biotech", r"pharma", r"medical", r"genomic"]),
-    ("Industrials", [r"industrial", r"aerospace", r"defense", r"transport", r"construction", r"infrastructure", r"machinery"]),
-    ("Consumer_Discretionary", [r"consumer discretionary", r"retail", r"e-commerce", r"travel", r"leisure", r"automotive"]),
-    ("Consumer_Staples", [r"consumer staples", r"food", r"beverage"]),
-    ("Utilities", [r"utilities", r"utility"]),
-    ("Materials", [r"materials", r"metals", r"mining", r"steel", r"copper", r"lithium", r"chemicals", r"timber"]),
-    ("Real_Estate", [r"real estate", r"\bREIT"]),
-    ("Communication_Services", [r"communication services", r"telecom", r"media", r"internet", r"social media"]),
-    ("Fixed_Income", [r"bond", r"treasury", r"municipal", r"muni", r"credit", r"fixed income", r"debt", r"high yield", r"corporate", r"floating rate"]),
-    ("Commodities", [r"gold", r"silver", r"commodity", r"commodities", r"precious metals", r"natural gas", r"crude oil"]),
-    ("International", [r"international", r"emerging market", r"developed market", r"Europe", r"Asia", r"Japan", r"China", r"India", r"Brazil", r"Latin America"]),
-    ("Broad_Market", [r"S&P 500", r"total stock", r"total market", r"Russell 1000", r"Russell 2000", r"Russell 3000", r"large[- ]cap", r"mid[- ]cap", r"small[- ]cap", r"dividend", r"\bvalue\b", r"\bgrowth\b", r"quality", r"momentum"]),
-    ("Thematic_Other", [r"clean energy", r"solar", r"wind", r"water", r"space", r"cannabis", r"blockchain", r"bitcoin", r"crypto", r"metaverse", r"gaming", r"innovation"]),
-]
-
-def classify(text, patterns, default):
-    text = str(text or "")
-    for label, pats in patterns:
-        if any(re.search(p, text, flags=re.IGNORECASE) for p in pats):
-            return label
-    return default
-
-@st.cache_data(ttl=3600)
-def read_pipe(url):
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text), sep="|")
-    first = df.columns[0]
-    return df[~df[first].astype(str).str.startswith("File Creation Time", na=False)]
-
-@st.cache_data(ttl=3600)
-def get_universe():
-    n = read_pipe(NASDAQ_LISTED)
-    o = read_pipe(OTHER_LISTED)
-
-    n = n[(n["ETF"] == "Y") & (n["Test Issue"] == "N")].copy()
-    n = n.rename(columns={"Symbol":"Ticker", "Security Name":"Fund_Name"})
-    n["Exchange"] = "Nasdaq"
-
-    o = o[(o["ETF"] == "Y") & (o["Test Issue"] == "N")].copy()
-    o = o.rename(columns={"ACT Symbol":"Ticker", "Security Name":"Fund_Name"})
-
-    u = pd.concat(
-        [n[["Ticker","Fund_Name","Exchange"]], o[["Ticker","Fund_Name","Exchange"]]],
-        ignore_index=True
-    )
-    u["YahooTicker"] = u["Ticker"].astype(str).str.replace(".", "-", regex=False)
-    u["Issuer_Group"] = u["Fund_Name"].map(lambda x: classify(x, ISSUER_PATTERNS, "Other_or_Unknown"))
-    u["Sector_Category"] = u["Fund_Name"].map(lambda x: classify(x, SECTOR_PATTERNS, "Unclassified"))
-    return u.drop_duplicates("YahooTicker").sort_values("YahooTicker").reset_index(drop=True)
-
-def normalize(df, ticker, meta):
+def normalize_database(df: pd.DataFrame) -> pd.DataFrame:
+    """Accept common database column names and normalize them."""
     if df is None or df.empty:
-        return pd.DataFrame()
+        raise ValueError("The mutual-fund database is empty.")
 
-    out = df.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        for level in range(out.columns.nlevels):
-            if ticker in set(map(str, out.columns.get_level_values(level))):
-                out = out.xs(ticker, axis=1, level=level, drop_level=True)
-                break
+    cols = {str(c).strip().lower(): c for c in df.columns}
+
+    def find_col(names):
+        for n in names:
+            if n in cols:
+                return cols[n]
+        return None
+
+    symbol_col = find_col(["symbol", "ticker", "fund_symbol", "fund ticker", "fund_ticker"])
+    name_col = find_col(["fund_name", "name", "security_name", "fund name", "description"])
+    institution_col = find_col([
+        "institution", "fund_family", "family", "sponsor",
+        "fund company", "fund_company", "issuer"
+    ])
+    category_col = find_col(["category", "fund_category", "asset_class", "type"])
+
+    if symbol_col is None:
+        raise ValueError(
+            "The database needs a Symbol or Ticker column. "
+            "Example columns: symbol, fund_name, institution, category."
+        )
+
+    out = pd.DataFrame()
+    out["symbol"] = df[symbol_col].map(clean_text).str.upper()
+    out["fund_name"] = df[name_col].map(clean_text) if name_col else ""
+    out["institution"] = (
+        df[institution_col].map(clean_text) if institution_col else "Unassigned"
+    )
+    out["category"] = df[category_col].map(clean_text) if category_col else ""
+
+    out["institution"] = out["institution"].replace("", "Unassigned")
+    out = out[out["symbol"].str.match(r"^[A-Z0-9.\-]+$", na=False)]
+    out = out.drop_duplicates(subset=["symbol"], keep="first")
+    out = out.sort_values(["institution", "symbol"], kind="stable").reset_index(drop=True)
 
     if out.empty:
-        return pd.DataFrame()
-
-    if getattr(out.index, "tz", None) is not None:
-        out.index = out.index.tz_localize(None)
-
-    out.index.name = "Date"
-    out = out.reset_index()
-    out.insert(1, "Ticker", ticker)
-    out.insert(2, "Issuer_Group", meta["Issuer_Group"])
-    out.insert(3, "Sector_Category", meta["Sector_Category"])
-    out.insert(4, "Fund_Name", meta["Fund_Name"])
-
-    if "Close" in out.columns:
-        out = out[out["Close"].notna()]
+        raise ValueError("No valid mutual-fund ticker symbols were found.")
 
     return out
 
-def safe_name(value):
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("_") or "Unknown"
 
-
-INTERVAL_SETTINGS = {
-    "Daily (1d)": {
-        "interval": "1d",
-        "periods": ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"],
-        "default_period": "10y",
-        "label": "daily",
-    },
-    "Hourly (1h)": {
-        "interval": "1h",
-        "periods": ["5d", "1mo", "3mo", "6mo", "1y", "2y"],
-        "default_period": "1mo",
-        "label": "hourly",
-    },
-    "30 minute (30m)": {
-        "interval": "30m",
-        "periods": ["5d", "1mo"],
-        "default_period": "1mo",
-        "label": "30-minute",
-    },
-    "15 minute (15m)": {
-        "interval": "15m",
-        "periods": ["5d", "1mo"],
-        "default_period": "5d",
-        "label": "15-minute",
-    },
-}
-
-
-def yf_time_kwargs(period, start_date, end_date, range_mode):
-    if range_mode == "custom":
-        return {
-            "start": str(start_date),
-            "end": str(end_date),
-        }
-    return {"period": period}
-
-def history_label(period, start_date, end_date, range_mode):
-    if range_mode == "custom":
-        return f"{start_date}_to_{end_date}"
-    return str(period)
-
-def interval_period_picker(prefix, default_interval="Daily (1d)"):
-    interval_choice = st.selectbox(
-        "Data interval",
-        list(INTERVAL_SETTINGS.keys()),
-        index=list(INTERVAL_SETTINGS.keys()).index(default_interval),
-        key=f"{prefix}_interval_choice",
-        help=(
-            "Daily is best for long histories. Intraday data uses shorter lookback "
-            "choices because upstream intraday history is more limited."
-        ),
-    )
-
-    settings = INTERVAL_SETTINGS[interval_choice]
-
-    range_mode = st.radio(
-        "Date selection",
-        ["Recent period", "Year block", "Custom date range"],
-        horizontal=True,
-        key=f"{prefix}_range_mode",
-    )
-
-    if range_mode == "Recent period":
-        periods = settings["periods"]
-        default_period = settings["default_period"]
-        period = st.selectbox(
-            "History to include",
-            periods,
-            index=periods.index(default_period) if default_period in periods else 0,
-            key=f"{prefix}_period_choice",
+@st.cache_data(show_spinner=False)
+def load_repo_database(path_str: str) -> pd.DataFrame:
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{DB_FILENAME} was not found beside app.py."
         )
-        return (
-            interval_choice,
-            settings["interval"],
-            period,
-            settings["label"],
-            None,
-            None,
-            "period",
+    return normalize_database(pd.read_csv(path))
+
+
+def safe_filename(text: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.\-]+", "_", str(text).strip())
+    return text.strip("_") or "fund"
+
+
+def build_history_args(mode: str, interval: str):
+    """Return kwargs for yfinance.Ticker.history."""
+    if mode == "Recent period":
+        period = st.session_state.get("recent_period", "10y")
+        return {"period": period, "interval": interval}
+
+    if mode == "Year block":
+        start_year = int(st.session_state["start_year"])
+        end_year = int(st.session_state["end_year"])
+        if end_year < start_year:
+            start_year, end_year = end_year, start_year
+        start = date(start_year, 1, 1)
+        end = date(end_year, 12, 31) + timedelta(days=1)
+        return {"start": str(start), "end": str(end), "interval": interval}
+
+    start_date = st.session_state["custom_start"]
+    end_date = st.session_state["custom_end"]
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    return {
+        "start": str(start_date),
+        "end": str(end_date + timedelta(days=1)),
+        "interval": interval,
+    }
+
+
+def download_one(row: dict, history_kwargs: dict):
+    symbol = row["symbol"]
+    try:
+        hist = yf.Ticker(symbol).history(
+            auto_adjust=False,
+            actions=True,
+            **history_kwargs,
         )
 
-    today = date.today()
+        if hist is None or hist.empty:
+            return symbol, None, "No price history returned."
 
-    if range_mode == "Year block":
-        block_years = st.selectbox(
-            "Years per block",
-            [1, 2, 3, 5, 10],
-            index=1,
-            key=f"{prefix}_block_years",
-            help="Choose how many years each historical block should contain.",
-        )
-        block_number = st.number_input(
-            "Historical block",
-            min_value=1,
-            max_value=20,
-            value=1,
-            step=1,
-            key=f"{prefix}_block_number",
-            help="Block 1 is the most recent block. Block 2 is the block immediately before it, and so on.",
-        )
-        end_date = today - relativedelta(years=block_years * (int(block_number) - 1))
-        start_date = end_date - relativedelta(years=block_years)
-        st.info(
-            f"Block {int(block_number)}: {start_date.isoformat()} through {end_date.isoformat()} "
-            f"({block_years} year{'s' if block_years != 1 else ''})"
-        )
-        return (
-            interval_choice,
-            settings["interval"],
-            None,
-            settings["label"],
-            start_date,
-            end_date,
-            "custom",
-        )
+        hist = hist.copy()
+        hist.index.name = "Date"
+        hist = hist.reset_index()
 
-    default_start = today - relativedelta(years=2)
-    start_date = st.date_input(
-        "Start date",
-        value=default_start,
-        key=f"{prefix}_start_date",
-    )
-    end_date = st.date_input(
-        "End date",
-        value=today,
-        key=f"{prefix}_end_date",
-    )
-
-    if start_date >= end_date:
-        st.warning("Start date must be earlier than end date.")
-
-    return (
-        interval_choice,
-        settings["interval"],
-        None,
-        settings["label"],
-        start_date,
-        end_date,
-        "custom",
-    )
-
-def download_chunk(chunk_df, period, interval, start_date=None, end_date=None, range_mode="period"):
-    tickers = chunk_df["YahooTicker"].tolist()
-    # Download smaller internal groups for better reliability on older ranges.
-    raw_parts = []
-    internal_size = 20
-    for internal_start in range(0, len(tickers), internal_size):
-        internal_tickers = tickers[internal_start:internal_start + internal_size]
-        part = yf.download(
-        tickers=internal_tickers,
-        interval=interval,
-        auto_adjust=False,
-        actions=False,
-        group_by="column",
-        threads=True,
-        progress=False,
-        timeout=30,
-        **yf_time_kwargs(period, start_date, end_date, range_mode),
-    )
-
-    meta = chunk_df.set_index("YahooTicker")
-    results = {}
-    failed = []
-
-    for ticker in tickers:
-        row = meta.loc[ticker]
-        one = pd.DataFrame()
-
-        try:
-            one = normalize(raw, ticker, row)
-        except Exception:
-            pass
-
-        if one.empty:
+        # Make the date column friendly for CSV output.
+        if "Date" in hist.columns:
             try:
-                retry = yf.download(
-                    ticker,
-                    interval=interval,
-                    auto_adjust=False,
-                    actions=False,
-                    progress=False,
-                    timeout=20,
-                    **yf_time_kwargs(period, start_date, end_date, range_mode),
-                )
-                one = normalize(retry, ticker, row)
+                hist["Date"] = pd.to_datetime(hist["Date"]).dt.strftime("%Y-%m-%d")
             except Exception:
-                one = pd.DataFrame()
+                pass
 
-        if one.empty:
-            failed.append(ticker)
-        else:
-            results[ticker] = one
+        # Add fund metadata to every record.
+        hist.insert(0, "Institution", row.get("institution", ""))
+        hist.insert(0, "Fund_Name", row.get("fund_name", ""))
+        hist.insert(0, "Symbol", symbol)
 
-    return results, failed
+        return symbol, hist, ""
 
-def build_batch_zip(results, batch_df, failed, batch_number, total_batches, period):
-    buf = io.BytesIO()
-    all_frames = []
-    by_issuer = {}
-    by_sector = {}
+    except Exception as exc:
+        return symbol, None, str(exc)
 
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for ticker, df in sorted(results.items()):
-            issuer = safe_name(df["Issuer_Group"].iloc[0])
-            sector = safe_name(df["Sector_Category"].iloc[0])
 
-            z.writestr(
-                f"By_Institution/{issuer}/{sector}/{ticker}.csv",
-                df.to_csv(index=False)
+def make_zip(batch_df: pd.DataFrame, history_kwargs: dict):
+    rows = batch_df.to_dict("records")
+    successes = []
+    errors = []
+
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(download_one, row, history_kwargs): row
+            for row in rows
+        }
+
+        completed = 0
+        for fut in as_completed(futures):
+            row = futures[fut]
+            completed += 1
+            symbol, hist, err = fut.result()
+
+            status.write(
+                f"Downloading mutual funds… {completed:,} / {len(rows):,} "
+                f"• {symbol}"
             )
-            all_frames.append(df)
-            by_issuer.setdefault(issuer, []).append(df)
-            by_sector.setdefault(sector, []).append(df)
+            progress.progress(completed / max(1, len(rows)))
 
-        if all_frames:
-            z.writestr(
-                "BATCH_ALL_ETFS.csv",
-                pd.concat(all_frames, ignore_index=True).to_csv(index=False)
-            )
+            if hist is None:
+                errors.append({
+                    "symbol": symbol,
+                    "fund_name": row.get("fund_name", ""),
+                    "institution": row.get("institution", ""),
+                    "error": err,
+                })
+            else:
+                successes.append((row, hist))
 
-        for issuer, frames in by_issuer.items():
-            z.writestr(
-                f"By_Institution/{issuer}/ALL_{issuer}_ETFS_IN_THIS_BATCH.csv",
-                pd.concat(frames, ignore_index=True).to_csv(index=False)
-            )
+    status.write(
+        f"Finished • {len(successes):,} downloaded • {len(errors):,} error(s)"
+    )
 
-        for sector, frames in by_sector.items():
-            z.writestr(
-                f"By_Sector/{sector}/ALL_{sector}_ETFS_IN_THIS_BATCH.csv",
-                pd.concat(frames, ignore_index=True).to_csv(index=False)
-            )
+    memory = io.BytesIO()
+    combined_frames = []
 
-        z.writestr("BATCH_ETF_LIST.csv", batch_df.to_csv(index=False))
+    with zipfile.ZipFile(memory, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        manifest_rows = []
 
-        if failed:
-            z.writestr("FAILED_TICKERS.txt", "\n".join(sorted(set(failed))))
+        for row, hist in successes:
+            symbol = row["symbol"]
+            fund_name = row.get("fund_name", "")
+            institution = row.get("institution", "")
 
-        z.writestr(
-            "README.txt",
-            (
-                "ETF Batch Download\n"
-                "==================\n\n"
-                f"Batch: {batch_number} of {total_batches}\n"
-                f"Created: {date.today().isoformat()}\n"
-                f"Daily history: {period}\n"
-                f"ETF symbols assigned to this batch: {len(batch_df)}\n"
-                f"Successful downloads: {len(results)}\n"
-                f"Failed downloads: {len(set(failed))}\n\n"
-                "This ZIP is one piece of a larger ETF-universe download.\n"
-                "Upload one or several batch ZIPs to ChatGPT for analysis.\n"
-            )
+            filename = f"{safe_filename(symbol)}.csv"
+            zf.writestr(filename, hist.to_csv(index=False))
+
+            combined_frames.append(hist)
+
+            manifest_rows.append({
+                "symbol": symbol,
+                "fund_name": fund_name,
+                "institution": institution,
+                "rows_downloaded": len(hist),
+                "file": filename,
+                "status": "OK",
+            })
+
+        for e in errors:
+            manifest_rows.append({
+                "symbol": e["symbol"],
+                "fund_name": e["fund_name"],
+                "institution": e["institution"],
+                "rows_downloaded": 0,
+                "file": "",
+                "status": f"ERROR: {e['error']}",
+            })
+
+        manifest = pd.DataFrame(manifest_rows)
+        zf.writestr("MANIFEST.csv", manifest.to_csv(index=False))
+
+        if errors:
+            zf.writestr("ERRORS.csv", pd.DataFrame(errors).to_csv(index=False))
+
+        if combined_frames:
+            combined = pd.concat(combined_frames, ignore_index=True)
+            zf.writestr("ALL_MUTUAL_FUNDS_COMBINED.csv", combined.to_csv(index=False))
+
+        readme = (
+            "Batched Mutual Fund Downloader\n\n"
+            "Each successfully downloaded mutual fund has its own CSV file.\n"
+            "ALL_MUTUAL_FUNDS_COMBINED.csv contains all successful downloads "
+            "in one long-format file.\n"
+            "MANIFEST.csv lists every requested symbol and its result.\n"
+            "ERRORS.csv appears only when one or more tickers failed.\n"
         )
+        zf.writestr("README.txt", readme)
 
-    buf.seek(0)
-    return buf.getvalue()
+    memory.seek(0)
+    return memory.getvalue(), len(successes), errors
+
+
+# -------------------------------------------------------------------
+# Page
+# -------------------------------------------------------------------
+
+st.title("📥 Batched Mutual Fund Downloader")
+st.caption("GitHub / Streamlit version • downloads mutual-fund price history in ZIP batches")
+
+with st.expander("Mutual-fund database", expanded=False):
+    st.write(
+        "The deployed GitHub app reads **mutual_funds.csv** from the same "
+        "repository as **app.py**. You can also upload a CSV here temporarily "
+        "to test a new database before committing it to GitHub."
+    )
+    uploaded_db = st.file_uploader(
+        "Optional temporary mutual-fund CSV",
+        type=["csv"],
+        help="Required column: symbol or ticker. Optional: fund_name, institution/fund_family, category.",
+    )
 
 try:
-    universe = get_universe()
-except Exception as e:
-    st.error(f"Could not load ETF universe: {e}")
+    if uploaded_db is not None:
+        database = normalize_database(pd.read_csv(uploaded_db))
+        db_source = "Temporary uploaded CSV"
+    else:
+        database = load_repo_database(str(Path(__file__).with_name(DB_FILENAME)))
+        db_source = DB_FILENAME
+except Exception as exc:
+    st.error(str(exc))
     st.stop()
 
-c1, c2, c3 = st.columns(3)
-c1.metric("ETF symbols", f"{len(universe):,}")
-c2.metric("Institutions", f"{universe['Issuer_Group'].nunique():,}")
-c3.metric("Sectors/categories", f"{universe['Sector_Category'].nunique():,}")
+st.success(
+    f"Database ready: **{len(database):,} mutual-fund symbols** • Source: **{db_source}**"
+)
 
-st.subheader("1. Choose institution and history")
+st.header("1. Choose institution and history")
 
-institution_options = ["All Institutions"] + sorted(universe["Issuer_Group"].unique().tolist())
+institutions = sorted(database["institution"].dropna().unique().tolist())
 institution = st.selectbox(
-    "Financial institution / ETF sponsor",
-    institution_options,
-    index=0,
-)
-
-(
-    interval_choice,
-    data_interval,
-    period,
-    interval_label,
-    institution_start,
-    institution_end,
-    institution_range_mode,
-) = interval_period_picker(
-    "institution",
-    default_interval="Daily (1d)"
-)
-
-batch_size = st.select_slider(
-    "ETFs per ZIP batch",
-    options=[100, 150, 200, 250, 300, 400, 500],
-    value=200,
-    help="For 10-year history, 150–200 ETFs per batch is recommended."
+    "Financial institution / fund family",
+    ["All Institutions"] + institutions,
 )
 
 if institution == "All Institutions":
-    institution_df = universe.copy()
-    institution_label = "ALL_INSTITUTIONS"
+    filtered = database.copy()
 else:
-    institution_df = universe[universe["Issuer_Group"] == institution].copy()
-    institution_label = safe_name(institution)
+    filtered = database[database["institution"] == institution].copy()
 
-total_batches = max(1, math.ceil(len(institution_df) / batch_size))
+interval_label = st.selectbox(
+    "Data interval",
+    ["Daily (1d)", "Weekly (1wk)", "Monthly (1mo)"],
+)
+interval = {
+    "Daily (1d)": "1d",
+    "Weekly (1wk)": "1wk",
+    "Monthly (1mo)": "1mo",
+}[interval_label]
 
-st.info(
-    f"{institution}: {len(institution_df):,} ETF symbols. "
-    f"At {batch_size} ETFs per ZIP, this institution/group requires {total_batches} batch(es)."
+st.write("Date selection")
+mode = st.radio(
+    "Date selection",
+    ["Recent period", "Year block", "Custom date range"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
 
-st.subheader("2. Choose the institution batch")
+current_year = date.today().year
+
+if mode == "Recent period":
+    st.selectbox(
+        "History to include",
+        ["1y", "2y", "5y", "10y", "max"],
+        index=3,
+        key="recent_period",
+    )
+
+elif mode == "Year block":
+    c1, c2 = st.columns(2)
+    years = list(range(1980, current_year + 1))
+    with c1:
+        st.selectbox(
+            "Start year",
+            years,
+            index=max(0, len(years) - 11),
+            key="start_year",
+        )
+    with c2:
+        st.selectbox(
+            "End year",
+            years,
+            index=len(years) - 1,
+            key="end_year",
+        )
+
+else:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.date_input(
+            "Start date",
+            value=date.today() - timedelta(days=3650),
+            key="custom_start",
+        )
+    with c2:
+        st.date_input(
+            "End date",
+            value=date.today(),
+            key="custom_end",
+        )
+
+batch_size = st.slider(
+    "Mutual funds per ZIP batch",
+    min_value=25,
+    max_value=500,
+    value=200,
+    step=25,
+)
+
+batch_count = max(1, math.ceil(len(filtered) / batch_size))
+
+st.info(
+    f"{institution}: **{len(filtered):,} mutual-fund symbols**. "
+    f"At **{batch_size} funds per ZIP**, this group requires "
+    f"**{batch_count} batch(es)**."
+)
+
+st.header("2. Choose the institution batch")
 
 batch_number = st.number_input(
     "Batch number",
     min_value=1,
-    max_value=total_batches,
+    max_value=batch_count,
     value=1,
     step=1,
 )
 
-start_row = (batch_number - 1) * batch_size
-end_row = min(start_row + batch_size, len(institution_df))
-batch_df = institution_df.iloc[start_row:end_row].copy()
+start = (int(batch_number) - 1) * batch_size
+end = min(start + batch_size, len(filtered))
+batch_df = filtered.iloc[start:end].copy()
 
 st.write(
-    f"{institution} — Batch {batch_number} of {total_batches}: "
-    f"{len(batch_df):,} ETF(s)."
+    f"**{institution} — Batch {int(batch_number)} of {batch_count}: "
+    f"{len(batch_df):,} mutual fund(s).**"
 )
 
-with st.expander("Preview this institution batch"):
+with st.expander("Preview this institution batch", expanded=False):
     st.dataframe(
-        batch_df[["YahooTicker","Fund_Name","Issuer_Group","Sector_Category"]],
+        batch_df[["symbol", "fund_name", "institution", "category"]],
         use_container_width=True,
         hide_index=True,
     )
 
-st.subheader("3. Build the ZIP")
-
-if st.button("Build institution batch ZIP", type="primary", use_container_width=True):
-    if batch_df.empty:
-        st.warning("This batch has no ETF symbols.")
-    else:
-        progress = st.progress(0)
-        status = st.empty()
-
-        request_chunk_size = 50
-        request_chunks = [
-            batch_df.iloc[i:i+request_chunk_size]
-            for i in range(0, len(batch_df), request_chunk_size)
-        ]
-
-        all_results = {}
-        all_failed = []
-
-        for i, chunk in enumerate(request_chunks, 1):
-            status.write(
-                f"Downloading {institution} — request chunk {i} of {len(request_chunks)}..."
-            )
-            try:
-                got, failed = download_chunk(chunk, period, data_interval, institution_start, institution_end, institution_range_mode)
-            except Exception:
-                got, failed = {}, chunk["YahooTicker"].tolist()
-
-            all_results.update(got)
-            all_failed.extend(failed)
-            progress.progress(i / len(request_chunks))
-
-            if i < len(request_chunks):
-                time.sleep(0.5)
-
-        progress.empty()
-        status.empty()
-
-        if not all_results:
-            st.error("No ETF data was downloaded for this institution batch.")
-        else:
-            bundle = build_batch_zip(
-                all_results,
-                batch_df,
-                all_failed,
-                batch_number,
-                total_batches,
-                period,
-            )
-
-            st.success(
-                f"{institution} — Batch {batch_number} is ready: "
-                f"{len(all_results):,} successful ETF downloads"
-                + (f", {len(set(all_failed)):,} failed." if all_failed else ".")
-            )
-
-            stamp = date.today().isoformat()
-            st.download_button(
-                f"🗜️ Download {institution} — Batch {batch_number} of {total_batches}",
-                data=bundle,
-                file_name=(
-                    f"{institution_label}_ETF_BATCH_{batch_number:02d}_OF_"
-                    f"{total_batches:02d}_{stamp}_{safe_name(history_label(period, institution_start, institution_end, institution_range_mode))}_{safe_name(interval_label)}.zip"
-                ),
-                mime="application/zip",
-                type="primary",
-                use_container_width=True,
-            )
-
-
-st.divider()
-st.header("🛡️ Short-Term Bond / Defensive Analyzer")
-st.write(
-    "Use this section for short holding periods from 1 day up to 3 weeks. "
-    "It downloads several years of daily history so you can study many past short-term windows."
-)
-
-DEFENSIVE_BOND_ETFS = {
-    "Treasury Bills / Ultra-Short": [
-        "BIL", "SGOV", "SHV", "GBIL", "CLIP"
-    ],
-    "Short Treasury": [
-        "SHY", "VGSH", "SCHO", "SPTS"
-    ],
-    "Floating / Ultra-Short Investment Grade": [
-        "FLOT", "FLRN", "JPST", "ICSH", "MINT"
-    ],
-    "Short Corporate Investment Grade": [
-        "VCSH", "SPSB", "IGSB", "SLQD"
-    ],
-    "TIPS / Inflation Protected": [
-        "VTIP", "STIP", "SCHP"
-    ],
-}
-
-st.subheader("Short-horizon bond ETF data")
-
-bond_group = st.selectbox(
-    "Bond / defensive group",
-    ["All Short-Term Defensive Groups"] + list(DEFENSIVE_BOND_ETFS.keys()),
-    key="bond_group"
-)
-
-(
-    bond_interval_choice,
-    bond_interval,
-    bond_history,
-    bond_interval_label,
-    bond_start,
-    bond_end,
-    bond_range_mode,
-) = interval_period_picker(
-    "bond",
-    default_interval="Daily (1d)"
-)
-
-if bond_group == "All Short-Term Defensive Groups":
-    bond_tickers = []
-    for group_tickers in DEFENSIVE_BOND_ETFS.values():
-        for ticker in group_tickers:
-            if ticker not in bond_tickers:
-                bond_tickers.append(ticker)
-else:
-    bond_tickers = DEFENSIVE_BOND_ETFS[bond_group]
-
-st.caption("Selected bond ETFs: " + ", ".join(bond_tickers))
-
-HOLD_WINDOWS = {
-    "1 trading day": 1,
-    "2 trading days": 2,
-    "3 trading days": 3,
-    "4 trading days": 4,
-    "5 trading days / about 1 week": 5,
-    "6 trading days": 6,
-    "7 trading days": 7,
-    "8 trading days": 8,
-    "9 trading days": 9,
-    "10 trading days / about 2 weeks": 10,
-    "11 trading days": 11,
-    "12 trading days": 12,
-    "13 trading days": 13,
-    "14 trading days": 14,
-    "15 trading days / about 3 weeks": 15,
-}
-
-selected_windows = st.multiselect(
-    "Short holding periods to calculate",
-    options=list(HOLD_WINDOWS.keys()),
-    default=[
-        "1 trading day",
-        "3 trading days",
-        "5 trading days / about 1 week",
-        "10 trading days / about 2 weeks",
-        "15 trading days / about 3 weeks",
-    ],
-    key="bond_windows"
-)
-
-def download_bond_history(tickers, period, interval, start_date=None, end_date=None, range_mode="period"):
-    raw = yf.download(
-        tickers=tickers,
-        interval=interval,
-        auto_adjust=False,
-        actions=False,
-        group_by="column",
-        threads=True,
-        progress=False,
-        timeout=30,
-        **yf_time_kwargs(period, start_date, end_date, range_mode),
-    )
-    out = {}
-    for ticker in tickers:
-        try:
-            one = raw.copy()
-            if isinstance(one.columns, pd.MultiIndex):
-                ticker_level = None
-                for level in range(one.columns.nlevels):
-                    if ticker in set(map(str, one.columns.get_level_values(level))):
-                        ticker_level = level
-                        break
-                if ticker_level is not None:
-                    one = one.xs(ticker, axis=1, level=ticker_level, drop_level=True)
-
-            if one is None or one.empty:
-                continue
-
-            if getattr(one.index, "tz", None) is not None:
-                one.index = one.index.tz_localize(None)
-
-            one.index.name = "Date"
-            one = one.reset_index()
-            one.insert(1, "Ticker", ticker)
-
-            if "Close" in one.columns:
-                one = one[one["Close"].notna()]
-
-            if not one.empty:
-                out[ticker] = one
-        except Exception:
-            pass
-    return out
-
-def short_window_stats(df, ticker, selected_windows):
-    if df.empty or "Close" not in df.columns:
-        return pd.DataFrame()
-
-    prices = df[["Date", "Close"]].copy().sort_values("Date")
-    rows = []
-
-    for label in selected_windows:
-        days = HOLD_WINDOWS[label]
-        future = prices["Close"].shift(-days)
-        returns = (future / prices["Close"] - 1.0) * 100.0
-        valid = returns.dropna()
-
-        if valid.empty:
-            continue
-
-        rows.append({
-            "Ticker": ticker,
-            "Holding_Period": label,
-            "Trading_Days": days,
-            "Observations": int(valid.shape[0]),
-            "Average_Return_%": float(valid.mean()),
-            "Median_Return_%": float(valid.median()),
-            "Best_Return_%": float(valid.max()),
-            "Worst_Return_%": float(valid.min()),
-            "Positive_Periods_%": float((valid > 0).mean() * 100.0),
-        })
-
-    return pd.DataFrame(rows)
-
-def make_bond_zip(results, stats_df, group_name, history_period):
-    buf = io.BytesIO()
-
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        combined = []
-
-        for ticker, df in sorted(results.items()):
-            z.writestr(
-                f"Bond_ETFs/{ticker}.csv",
-                df.to_csv(index=False)
-            )
-            combined.append(df)
-
-        if combined:
-            z.writestr(
-                "ALL_SHORT_TERM_BOND_ETFS.csv",
-                pd.concat(combined, ignore_index=True).to_csv(index=False)
-            )
-
-        if stats_df is not None and not stats_df.empty:
-            z.writestr(
-                "SHORT_HOLDING_PERIOD_ANALYSIS.csv",
-                stats_df.to_csv(index=False)
-            )
-
-        z.writestr(
-            "README.txt",
-            (
-                "Short-Term Bond / Defensive ETF Export\n"
-                "======================================\n\n"
-                f"Created: {date.today().isoformat()}\n"
-                f"Group: {group_name}\n"
-                f"Historical lookback: {history_period}\n\n"
-                "The historical data can span years, but the analysis windows are short:\n"
-                "1 to 15 trading days, roughly 1 day through 3 weeks.\n\n"
-                "This is designed for studying short holding periods, not for assuming "
-                "that any bond ETF will necessarily rise during a market decline.\n"
-            )
-        )
-
-    buf.seek(0)
-    return buf.getvalue()
-
-if st.button("Build short-term bond ZIP + analysis", type="primary", use_container_width=True, key="bond_build"):
-    with st.spinner("Downloading bond ETF history and calculating short holding periods..."):
-        bond_results = download_bond_history(bond_tickers, bond_history, bond_interval, bond_start, bond_end, bond_range_mode)
-
-        stats_frames = []
-        if bond_interval == "1d":
-            for ticker, df in bond_results.items():
-                stats = short_window_stats(df, ticker, selected_windows)
-                if not stats.empty:
-                    stats_frames.append(stats)
-        else:
-            st.info(
-                "Short holding-period return analysis is calculated only for Daily (1d) data. "
-                "Your intraday CSV files will still be downloaded."
-            )
-
-        stats_df = pd.concat(stats_frames, ignore_index=True) if stats_frames else pd.DataFrame()
-
-        st.session_state["bond_results"] = bond_results
-        st.session_state["bond_stats"] = stats_df
-        st.session_state["bond_group_used"] = bond_group
-        st.session_state["bond_history_used"] = bond_history
-
-if "bond_results" in st.session_state:
-    bond_results = st.session_state["bond_results"]
-    stats_df = st.session_state["bond_stats"]
-    bond_group_used = st.session_state["bond_group_used"]
-    bond_history_used = st.session_state["bond_history_used"]
-
-    if not bond_results:
-        st.error("No bond ETF data was returned.")
-    else:
-        st.success(f"Loaded {len(bond_results)} short-term bond / defensive ETF(s).")
-
-        if not stats_df.empty:
-            st.subheader("Short holding-period comparison")
-            display_stats = stats_df.copy()
-            for col in [
-                "Average_Return_%",
-                "Median_Return_%",
-                "Best_Return_%",
-                "Worst_Return_%",
-                "Positive_Periods_%"
-            ]:
-                display_stats[col] = display_stats[col].round(3)
-
-            st.dataframe(
-                display_stats.sort_values(
-                    ["Trading_Days", "Average_Return_%"],
-                    ascending=[True, False]
-                ),
-                use_container_width=True,
-                hide_index=True
-            )
-
-        bond_zip = make_bond_zip(
-            bond_results,
-            stats_df,
-            bond_group_used,
-            bond_history_used
-        )
-
-        stamp = date.today().isoformat()
-        safe_group = safe_name(bond_group_used)
-
-        st.download_button(
-            "🗜️ Download short-term bond ETF ZIP",
-            data=bond_zip,
-            file_name=f"SHORT_TERM_BOND_ETFS_{safe_group}_{stamp}_{safe_name(history_label(bond_history, bond_start, bond_end, bond_range_mode))}.zip",
-            mime="application/zip",
-            type="primary",
-            use_container_width=True,
-            key="bond_download"
-        )
-
-st.caption(
-    "Short-horizon calculations use trading days, not calendar days. "
-    "The 5-, 10-, and 15-trading-day windows are rough equivalents of about 1, 2, and 3 market weeks."
-)
-
-
-st.divider()
-st.header("📊 Market Indicators")
-st.write(
-    "Download major U.S. stock indexes, volatility, Treasury-yield indicators, "
-    "the U.S. dollar, gold, and crude oil. The app also calculates short-term "
-    "changes from 1 through 15 trading days."
-)
-
-MARKET_INDICATORS = {
-    "U.S. Stock Indexes": {
-        "^GSPC": "S&P 500 Index",
-        "^DJI": "Dow Jones Industrial Average",
-        "^IXIC": "Nasdaq Composite",
-        "^NDX": "Nasdaq-100 Index",
-        "^RUT": "Russell 2000 Index",
-    },
-    "Volatility": {
-        "^VIX": "CBOE Volatility Index (VIX)",
-    },
-    "Treasury Yield Indicators": {
-        "^IRX": "13-Week Treasury Bill Yield",
-        "^FVX": "5-Year Treasury Yield",
-        "^TNX": "10-Year Treasury Yield",
-        "^TYX": "30-Year Treasury Yield",
-    },
-    "Dollar / Commodities": {
-        "DX-Y.NYB": "U.S. Dollar Index",
-        "GC=F": "Gold Futures",
-        "CL=F": "WTI Crude Oil Futures",
-    },
-    "Tradable Market Proxies": {
-        "SPY": "SPDR S&P 500 ETF",
-        "DIA": "SPDR Dow Jones Industrial Average ETF",
-        "QQQ": "Invesco QQQ / Nasdaq-100 ETF",
-        "IWM": "iShares Russell 2000 ETF",
-    },
-}
-
-indicator_groups = st.multiselect(
-    "Indicator groups",
-    options=list(MARKET_INDICATORS.keys()),
-    default=list(MARKET_INDICATORS.keys()),
-    key="indicator_groups"
-)
-
-(
-    indicator_interval_choice,
-    indicator_interval,
-    indicator_history,
-    indicator_interval_label,
-    indicator_start,
-    indicator_end,
-    indicator_range_mode,
-) = interval_period_picker(
-    "indicator",
-    default_interval="Daily (1d)"
-)
-
-indicator_tickers = []
-indicator_names = {}
-for group in indicator_groups:
-    for ticker, name in MARKET_INDICATORS[group].items():
-        if ticker not in indicator_tickers:
-            indicator_tickers.append(ticker)
-            indicator_names[ticker] = name
-
-st.caption(
-    "Selected indicators: "
-    + (", ".join(indicator_tickers) if indicator_tickers else "None")
-)
-
-indicator_windows = st.multiselect(
-    "Short-term indicator windows",
-    options=list(HOLD_WINDOWS.keys()),
-    default=[
-        "1 trading day",
-        "3 trading days",
-        "5 trading days / about 1 week",
-        "10 trading days / about 2 weeks",
-        "15 trading days / about 3 weeks",
-    ],
-    key="indicator_windows"
-)
-
-def download_indicator_history(tickers, period, interval, start_date=None, end_date=None, range_mode="period"):
-    if not tickers:
-        return {}
-
-    raw = yf.download(
-        tickers=tickers,
-        interval=interval,
-        auto_adjust=False,
-        actions=False,
-        group_by="column",
-        threads=True,
-        progress=False,
-        timeout=30,
-        **yf_time_kwargs(period, start_date, end_date, range_mode),
-    )
-
-    results = {}
-
-    for ticker in tickers:
-        try:
-            one = raw.copy()
-
-            if isinstance(one.columns, pd.MultiIndex):
-                ticker_level = None
-                for level in range(one.columns.nlevels):
-                    if ticker in set(map(str, one.columns.get_level_values(level))):
-                        ticker_level = level
-                        break
-
-                if ticker_level is not None:
-                    one = one.xs(
-                        ticker,
-                        axis=1,
-                        level=ticker_level,
-                        drop_level=True
-                    )
-
-            if one is None or one.empty:
-                continue
-
-            if getattr(one.index, "tz", None) is not None:
-                one.index = one.index.tz_localize(None)
-
-            one.index.name = "Date"
-            one = one.reset_index()
-            one.insert(1, "Ticker", ticker)
-            one.insert(
-                2,
-                "Indicator_Name",
-                indicator_names.get(ticker, ticker)
-            )
-
-            if "Close" in one.columns:
-                one = one[one["Close"].notna()]
-
-            if not one.empty:
-                results[ticker] = one
-
-        except Exception:
-            pass
-
-    return results
-
-def indicator_short_window_stats(df, ticker, name, selected_windows):
-    if df.empty or "Close" not in df.columns:
-        return pd.DataFrame()
-
-    values = df[["Date", "Close"]].copy().sort_values("Date")
-    rows = []
-
-    for label in selected_windows:
-        days = HOLD_WINDOWS[label]
-        future = values["Close"].shift(-days)
-        changes = (future / values["Close"] - 1.0) * 100.0
-        valid = changes.dropna()
-
-        if valid.empty:
-            continue
-
-        rows.append({
-            "Ticker": ticker,
-            "Indicator_Name": name,
-            "Holding_Period": label,
-            "Trading_Days": days,
-            "Observations": int(valid.shape[0]),
-            "Average_Change_%": float(valid.mean()),
-            "Median_Change_%": float(valid.median()),
-            "Best_Change_%": float(valid.max()),
-            "Worst_Change_%": float(valid.min()),
-            "Positive_Periods_%": float((valid > 0).mean() * 100.0),
-        })
-
-    return pd.DataFrame(rows)
-
-def make_indicator_zip(results, stats_df, history_period):
-    buf = io.BytesIO()
-
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        combined = []
-
-        for ticker, df in sorted(results.items()):
-            z.writestr(
-                f"Market_Indicators/{safe_name(ticker)}.csv",
-                df.to_csv(index=False)
-            )
-            combined.append(df)
-
-        if combined:
-            z.writestr(
-                "ALL_MARKET_INDICATORS.csv",
-                pd.concat(combined, ignore_index=True).to_csv(index=False)
-            )
-
-        if stats_df is not None and not stats_df.empty:
-            z.writestr(
-                "MARKET_INDICATOR_SHORT_WINDOW_ANALYSIS.csv",
-                stats_df.to_csv(index=False)
-            )
-
-        mapping_rows = []
-        for group, mapping in MARKET_INDICATORS.items():
-            for ticker, name in mapping.items():
-                if ticker in indicator_tickers:
-                    mapping_rows.append({
-                        "Group": group,
-                        "Ticker": ticker,
-                        "Indicator_Name": name,
-                    })
-
-        z.writestr(
-            "MARKET_INDICATOR_LIST.csv",
-            pd.DataFrame(mapping_rows).to_csv(index=False)
-        )
-
-        z.writestr(
-            "README.txt",
-            (
-                "Market Indicator Export\n"
-                "=======================\n\n"
-                f"Created: {date.today().isoformat()}\n"
-                f"Historical lookback: {history_period}\n\n"
-                "Includes selected stock indexes, VIX, Treasury-yield indicators, "
-                "the U.S. dollar, gold, crude oil, and tradable ETF market proxies.\n\n"
-                "Short-window analysis uses trading-day changes from 1 through 15 trading days.\n"
-                "For Treasury-yield symbols, percentage-change calculations describe changes "
-                "in the quoted yield-index level, not total return from owning a Treasury security.\n"
-            )
-        )
-
-    buf.seek(0)
-    return buf.getvalue()
+history_kwargs = build_history_args(mode, interval)
 
 if st.button(
-    "Build market indicator ZIP + analysis",
+    "📦 BUILD THIS MUTUAL-FUND ZIP BATCH",
     type="primary",
     use_container_width=True,
-    key="indicator_build"
 ):
-    if not indicator_tickers:
-        st.warning("Choose at least one indicator group.")
-    else:
-        with st.spinner(
-            "Downloading market indicators and calculating short-term changes..."
-        ):
-            indicator_results = download_indicator_history(
-                indicator_tickers,
-                indicator_history,
-                indicator_interval,
-                indicator_start,
-                indicator_end,
-                indicator_range_mode,
-            )
+    with st.spinner("Building ZIP batch…"):
+        zip_bytes, ok_count, errors = make_zip(batch_df, history_kwargs)
 
-            stats_frames = []
-            if indicator_interval == "1d":
-                for ticker, df in indicator_results.items():
-                    stats = indicator_short_window_stats(
-                        df,
-                        ticker,
-                        indicator_names.get(ticker, ticker),
-                        indicator_windows
-                    )
-                    if not stats.empty:
-                        stats_frames.append(stats)
-            else:
-                st.info(
-                    "Short-window percentage analysis is calculated only for Daily (1d) data. "
-                    "Your intraday market-indicator CSV files will still be downloaded."
-                )
+    tag = safe_filename(institution)
+    filename = (
+        f"MUTUAL_FUNDS_{tag}_BATCH_{int(batch_number):02d}_OF_{batch_count:02d}.zip"
+    )
 
-            indicator_stats = (
-                pd.concat(stats_frames, ignore_index=True)
-                if stats_frames else pd.DataFrame()
-            )
+    st.session_state["last_zip_bytes"] = zip_bytes
+    st.session_state["last_zip_name"] = filename
+    st.session_state["last_zip_ok"] = ok_count
+    st.session_state["last_zip_errors"] = len(errors)
 
-            st.session_state["indicator_results"] = indicator_results
-            st.session_state["indicator_stats"] = indicator_stats
-            st.session_state["indicator_history_used"] = indicator_history
-
-if "indicator_results" in st.session_state:
-    indicator_results = st.session_state["indicator_results"]
-    indicator_stats = st.session_state["indicator_stats"]
-    indicator_history_used = st.session_state["indicator_history_used"]
-
-    if not indicator_results:
-        st.error("No market-indicator data was returned.")
-    else:
-        st.success(
-            f"Loaded {len(indicator_results)} market indicators."
-        )
-
-        if not indicator_stats.empty:
-            display_indicator_stats = indicator_stats.copy()
-
-            for col in [
-                "Average_Change_%",
-                "Median_Change_%",
-                "Best_Change_%",
-                "Worst_Change_%",
-                "Positive_Periods_%"
-            ]:
-                display_indicator_stats[col] = (
-                    display_indicator_stats[col].round(3)
-                )
-
-            st.subheader("Short-term market indicator comparison")
-            st.dataframe(
-                display_indicator_stats.sort_values(
-                    ["Trading_Days", "Average_Change_%"],
-                    ascending=[True, False]
-                ),
-                use_container_width=True,
-                hide_index=True
-            )
-
-        indicator_zip = make_indicator_zip(
-            indicator_results,
-            indicator_stats,
-            indicator_history_used
-        )
-
-        stamp = date.today().isoformat()
-
-        st.download_button(
-            "🗜️ Download market indicators ZIP",
-            data=indicator_zip,
-            file_name=(
-                f"MARKET_INDICATORS_{stamp}_{safe_name(history_label(indicator_history, indicator_start, indicator_end, indicator_range_mode))}.zip"
-            ),
-            mime="application/zip",
-            type="primary",
-            use_container_width=True,
-            key="indicator_download"
-        )
-
-st.caption(
-    "The market-indicator ZIP is separate from the ETF institution batches "
-    "and short-term bond ZIPs, so each dataset stays easy to identify."
-)
+if "last_zip_bytes" in st.session_state:
+    st.success(
+        f"ZIP is ready • {st.session_state['last_zip_ok']:,} successful "
+        f"• {st.session_state['last_zip_errors']:,} error(s)"
+    )
+    st.download_button(
+        "⬇️ DOWNLOAD MUTUAL-FUND ZIP",
+        data=st.session_state["last_zip_bytes"],
+        file_name=st.session_state["last_zip_name"],
+        mime="application/zip",
+        use_container_width=True,
+    )
 
 st.divider()
-st.markdown(
-    """
-### How the institution batches work
-
-Choose an ETF provider such as **BlackRock/iShares, Vanguard, State Street/SPDR,
-Invesco, Fidelity, or JPMorgan**. The app counts that institution's ETFs and
-automatically tells you how many ZIP batches are needed.
-
-For **10 years of daily data**, start with **200 ETFs per batch**.
-
-A large provider can have multiple files such as:
-
-`BlackRock_iShares_ETF_BATCH_01_OF_03_2026-08-15_10y.zip`
-
-`BlackRock_iShares_ETF_BATCH_02_OF_03_2026-08-15_10y.zip`
-
-A smaller provider may have only:
-
-`Vanguard_ETF_BATCH_01_OF_01_2026-08-15_10y.zip`
-
-Inside each ZIP, ETFs remain organized by **institution and sector/category**.
-
-You can also choose **All Institutions** if you want numbered batches covering
-the entire ETF universe.
-"""
+st.caption(
+    "Historical prices are requested from Yahoo Finance through yfinance. "
+    "Some mutual-fund symbols may be unavailable, renamed, merged, or delisted; "
+    "those symbols are listed in ERRORS.csv inside the ZIP."
 )

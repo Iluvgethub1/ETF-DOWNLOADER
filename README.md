@@ -1,58 +1,68 @@
-# ETF Downloader — Intervals + Custom Date Ranges + Automatic Daily Snapshot
+# Batched Mutual Fund Downloader
 
-This version adds one-click historical year blocks plus exact custom date ranges.
+GitHub-ready Streamlit app for downloading mutual-fund historical prices in ZIP batches.
 
-### Easy year blocks
-Choose **Year block**, then choose 1, 2, 3, 5, or 10 years per block.
-- Block 1 = most recent block
-- Block 2 = immediately preceding block
-- Block 3 = the block before that
+## Files
 
-Example with 2-year blocks on August 15, 2026:
-- Block 1: Aug 15, 2024 → Aug 15, 2026
-- Block 2: Aug 15, 2022 → Aug 15, 2024
-- Block 3: Aug 15, 2020 → Aug 15, 2022
+- `app.py` — Streamlit web application
+- `requirements.txt` — Python packages for Streamlit Community Cloud
+- `mutual_funds.csv` — mutual-fund database used by the app
 
-You do not need to type dates unless you choose Custom date range.
+## Mutual-fund database format
 
-For each major section you can choose:
+`mutual_funds.csv` must contain at least one ticker column named:
 
-- **Recent period** — examples: 2y, 5y, 10y, max
-- **Custom date range** — choose an exact Start Date and End Date
+- `symbol`, or
+- `ticker`
 
-Example:
+Recommended columns:
 
-- First download: 2024-08-15 to 2026-08-15
-- Previous two years: 2022-08-15 to 2024-08-15
-- Earlier two years: 2020-08-15 to 2022-08-15
+```text
+symbol,fund_name,institution,category
+VFIAX,Vanguard 500 Index Fund Admiral Shares,Vanguard,Large Blend
+FXAIX,Fidelity 500 Index Fund,Fidelity,Large Blend
+```
 
-This works especially well for Daily data.
+The app also recognizes `fund_family`, `family`, `sponsor`, `issuer`, or
+`fund_company` as the institution/fund-family column.
 
-Intraday data (Hourly, 30-minute, 15-minute) is subject to the upstream provider's historical intraday limits. Choosing an old custom range does not guarantee Yahoo Finance will provide that older intraday history.
+Replace the sample CSV with your full mutual-fund database when ready.
 
-The package still includes:
-- Institution-based ETF batches
-- Short-term bond / defensive analyzer
-- Market indicators
-- Daily / Hourly / 30-minute / 15-minute interval choices
-- Optional automatic weekday snapshots through GitHub Actions
+## Put it on GitHub
 
-## Update your live site
+1. Create a new GitHub repository.
+2. Upload:
+   - `app.py`
+   - `requirements.txt`
+   - `mutual_funds.csv`
+3. Commit the files.
+4. Open Streamlit Community Cloud.
+5. Choose **New app**.
+6. Select your GitHub repository and branch.
+7. Set the main file path to:
+   `app.py`
+8. Deploy.
 
-Copy all files and folders into the root of your existing `ETF-DOWNLOADER` repository.
+When you later update the mutual-fund database, replace `mutual_funds.csv`
+in GitHub and commit it. Streamlit will pick up the repository update.
 
-Replace the old:
-- app.py
-- README.md
-- requirements.txt
+## What a ZIP contains
 
-Keep/add:
-- auto_download.py
-- auto_tickers.txt
-- .github/workflows/daily_market_update.yml
+For every successful mutual-fund ticker:
 
-Then in GitHub Desktop:
-1. Commit to main
-2. Push origin
+- one CSV named after the ticker
 
-Streamlit should redeploy automatically.
+It also contains:
+
+- `ALL_MUTUAL_FUNDS_COMBINED.csv`
+- `MANIFEST.csv`
+- `ERRORS.csv` when failures occur
+- `README.txt`
+
+## Important
+
+The app downloads historical data from Yahoo Finance through `yfinance`.
+
+Mutual funds may be renamed, merged, liquidated, converted, or unavailable
+from Yahoo Finance. Failed symbols are written to `ERRORS.csv` rather than
+stopping the whole batch.
