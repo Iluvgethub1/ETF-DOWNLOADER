@@ -54,3 +54,15 @@ It also uses Nasdaq's own **Fund Family Name** field for the mutual-fund institu
 
 ## Expanded categories for BOTH tabs
 ETFs and mutual funds now use the same expanded category engine. Exports include the Sector_Category column and By_Sector folders for equity sectors, bond types/durations, cash, geography, size/style, allocation/target-date, commodities, crypto/currency, derivatives, leveraged/inverse, and thematic products. Unmatched products receive a Diversified_Other label instead of Unclassified.
+
+
+## Mutual-fund source update (NFN Web Service)
+
+This build no longer depends on Nasdaq Trader's legacy FTP path.
+
+It first uses Nasdaq Fund Network's documented `InstrumentDirectory` web service and requests CSV.
+If that fails, it tries the legacy Nasdaq web-hosted directory. The parser accepts multiple current
+and historical field names because Nasdaq's NFN directory schema has evolved.
+
+There is also a manual mutual-fund ticker fallback. If Nasdaq changes the public directory again,
+you can still enter mutual-fund symbols and use the same year-block, batch, CSV and ZIP workflow.

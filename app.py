@@ -1,5 +1,4 @@
 import io
-import ftplib
 import math
 import re
 import time
@@ -20,8 +19,8 @@ st.set_page_config(
 
 NASDAQ_LISTED = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
 OTHER_LISTED = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
-NASDAQ_FTP_HOST = "ftp.nasdaqtrader.com"
-NASDAQ_FTP_MUTUAL_FUNDS_PATH = "/symboldirectory/mfundslist.txt"
+NFN_DIRECTORY_API = "https://api.nfn.nasdaq.com/servicecall/InstrumentDirectory.ashx"
+LEGACY_MUTUAL_FUNDS_HTTP = "https://www.nasdaqtrader.com/dynamic/SymDir/mfundslist.txt"
 
 st.title("📦 ETF + Mutual Fund Downloader")
 st.write(
@@ -164,138 +163,255 @@ def get_etf_universe():
     u["Sector_Category"] = u["Fund_Name"].map(lambda x: classify_fund_category(x, "ETF"))
     return u.drop_duplicates("YahooTicker").sort_values(["Issuer_Group", "YahooTicker"]).reset_index(drop=True)
 
-def fetch_nasdaq_mutual_fund_text():
-    """
-    Nasdaq's current symbol-directory page documents mfundslist.txt as an FTP file.
-    Fetch it directly from the Nasdaq Trader FTP server instead of the old HTTP URL.
-    """
-    buffer = io.BytesIO()
 
-    ftp = ftplib.FTP(NASDAQ_FTP_HOST, timeout=30)
+def _normalize_column_name(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+def _find_column(columns, candidates):
+    normalized = {_normalize_column_name(c): c for c in columns}
+    for candidate in candidates:
+        key = _normalize_column_name(candidate)
+        if key in normalized:
+            return normalized[key]
+    return None
+
+def _clean_directory_frame(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Strip whitespace from headers and text values.
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].astype(str).str.strip()
+
+    # Drop rows that are clearly file footers / empty records.
+    first_col = df.columns[0]
+    df = df[
+        ~df[first_col].astype(str).str.startswith("File Creation Time", na=False)
+    ]
+    return df
+
+def fetch_nfn_directory():
+    """
+    Preferred source: Nasdaq Fund Network's documented InstrumentDirectory
+    web service. It supports CSV via the Accept header and does not require us
+    to depend on the legacy FTP path that returned error 550.
+    """
+    errors = []
+
+    # 1) Current NFN web service.
     try:
-        ftp.login()
-        ftp.retrbinary(
-            f"RETR {NASDAQ_FTP_MUTUAL_FUNDS_PATH}",
-            buffer.write,
+        response = requests.get(
+            NFN_DIRECTORY_API,
+            headers={
+                "Accept": "text/csv",
+                "User-Agent": "Mozilla/5.0 ETF-Mutual-Fund-Downloader",
+            },
+            timeout=45,
         )
-    finally:
-        try:
-            ftp.quit()
-        except Exception:
-            pass
+        response.raise_for_status()
 
-    raw = buffer.getvalue()
+        content_type = response.headers.get("content-type", "").lower()
+        body = response.text.lstrip()
 
-    # Nasdaq's symbol-directory files are ASCII/Windows text. utf-8-sig handles
-    # a BOM if one is present; latin-1 fallback avoids parser crashes on odd bytes.
+        # Reject obvious HTML/error pages even if status is 200.
+        if "<html" in body[:300].lower() or "<!doctype" in body[:300].lower():
+            raise ValueError("NFN web service returned an HTML page instead of CSV.")
+
+        df = pd.read_csv(
+            io.StringIO(response.text),
+            dtype=str,
+            engine="python",
+            on_bad_lines="skip",
+        )
+        df = _clean_directory_frame(df)
+        if not df.empty and len(df.columns) >= 3:
+            return df, "Nasdaq NFN web service"
+        raise ValueError("NFN web service returned no usable directory rows.")
+    except Exception as e:
+        errors.append(f"NFN web service: {e}")
+
+    # 2) Legacy Nasdaq web-hosted pipe file as fallback.
     try:
-        return raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return raw.decode("latin-1")
-
-
-def parse_mutual_fund_directory(raw_text):
-    """
-    Parse the pipe-delimited mfundslist.txt defensively.
-    Expected fields:
-    Fund Symbol | Fund Name | Fund Family Name | Type | Category | Pricing Agent
-
-    We intentionally parse line-by-line instead of using pandas.read_csv so an
-    odd footer or malformed line cannot break the whole mutual-fund tab.
-    """
-    records = []
-
-    for raw_line in raw_text.splitlines():
-        line = raw_line.strip()
-
-        if not line:
-            continue
-
-        if line.startswith("File Creation Time"):
-            continue
-
-        parts = [p.strip() for p in line.split("|")]
-
-        # Header line.
-        if parts and parts[0].lower() == "fund symbol":
-            continue
-
-        # We need at least symbol, name and family.
-        if len(parts) < 3:
-            continue
-
-        # If a line contains extra delimiters, preserve the first six documented
-        # fields and ignore anything after them.
-        parts = parts[:6] + [""] * max(0, 6 - len(parts))
-
-        symbol, fund_name, family, fund_type, category, pricing_agent = parts[:6]
-
-        symbol = symbol.strip().upper()
-        fund_name = fund_name.strip()
-        family = family.strip()
-        fund_type = fund_type.strip().upper()
-        category = category.strip().upper()
-
-        if not symbol or not fund_name:
-            continue
-
-        # Keep actual mutual funds / supplemental mutual funds. Money-market
-        # funds can be added later as a separate product if desired.
-        if fund_type not in {"MF", "MS"}:
-            continue
-
-        records.append(
-            {
-                "Ticker": symbol,
-                "Fund_Name": fund_name,
-                "Fund_Family_Name": family or "Other_or_Unknown",
-                "Nasdaq_Fund_Type": fund_type,
-                "Nasdaq_Category": category,
-                "Pricing_Agent": pricing_agent,
-            }
+        response = requests.get(
+            LEGACY_MUTUAL_FUNDS_HTTP,
+            headers={"User-Agent": "Mozilla/5.0 ETF-Mutual-Fund-Downloader"},
+            timeout=45,
         )
+        response.raise_for_status()
 
-    if not records:
-        raise ValueError(
-            "Nasdaq mutual-fund directory was reached, but no mutual-fund records could be parsed."
-        )
+        body = response.text.lstrip()
+        if "<html" in body[:300].lower() or "<!doctype" in body[:300].lower():
+            raise ValueError("Legacy Nasdaq URL returned HTML instead of the directory.")
 
-    return pd.DataFrame(records)
+        # Parse line-by-line so one malformed line cannot break the page.
+        rows = []
+        header = None
+        for raw_line in response.text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("File Creation Time"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if header is None:
+                header = parts
+                continue
+            if len(parts) < 3:
+                continue
+            if len(parts) < len(header):
+                parts += [""] * (len(header) - len(parts))
+            rows.append(parts[:len(header)])
 
+        if not header or not rows:
+            raise ValueError("Legacy Nasdaq directory had no usable rows.")
+
+        df = pd.DataFrame(rows, columns=header)
+        df = _clean_directory_frame(df)
+        return df, "Nasdaq legacy web directory"
+    except Exception as e:
+        errors.append(f"Legacy Nasdaq directory: {e}")
+
+    raise RuntimeError(" | ".join(errors))
 
 @st.cache_data(ttl=3600)
 def get_mutual_fund_universe():
-    raw_text = fetch_nasdaq_mutual_fund_text()
-    u = parse_mutual_fund_directory(raw_text)
+    raw, source_name = fetch_nfn_directory()
 
-    u["YahooTicker"] = (
-        u["Ticker"]
-        .astype(str)
-        .str.strip()
-        .str.upper()
-        .str.replace(".", "-", regex=False)
+    # Current NFN files have evolved over time, so accept several documented /
+    # historical column names rather than hard-coding one schema.
+    symbol_col = _find_column(
+        raw.columns,
+        [
+            "NFN Symbol", "Fund Symbol", "Symbol", "Instrument Symbol",
+            "InstrumentSymbol", "Ticker"
+        ],
     )
+    name_col = _find_column(
+        raw.columns,
+        [
+            "Instrument Name", "Fund Name", "Security Name", "Name",
+            "InstrumentName"
+        ],
+    )
+    family_col = _find_column(
+        raw.columns,
+        [
+            "Fund Family Name", "Fund Family", "Issuer Manager",
+            "Issuer/Manager", "Issuer Manager Name", "Manager Name",
+            "FundFamilyName"
+        ],
+    )
+    type_col = _find_column(
+        raw.columns,
+        [
+            "Instrument Type", "Fund Type", "Type", "InstrumentType"
+        ],
+    )
+    category_col = _find_column(
+        raw.columns,
+        [
+            "Instrument Code", "Fund Code", "Category", "Fund Category",
+            "InstrumentCode"
+        ],
+    )
+    pricing_col = _find_column(
+        raw.columns,
+        [
+            "Pricing Agent", "PricingAgent"
+        ],
+    )
+
+    if symbol_col is None or name_col is None:
+        raise ValueError(
+            "Nasdaq directory loaded, but the symbol/name fields could not be identified. "
+            f"Available columns: {', '.join(map(str, raw.columns[:20]))}"
+        )
+
+    u = pd.DataFrame({
+        "Ticker": raw[symbol_col].astype(str).str.strip().str.upper(),
+        "Fund_Name": raw[name_col].astype(str).str.strip(),
+    })
+
+    if family_col:
+        u["Fund_Family_Name"] = raw[family_col].astype(str).str.strip()
+    else:
+        u["Fund_Family_Name"] = ""
+
+    if type_col:
+        u["Nasdaq_Fund_Type"] = raw[type_col].astype(str).str.strip().str.upper()
+    else:
+        u["Nasdaq_Fund_Type"] = ""
+
+    if category_col:
+        u["Nasdaq_Category"] = raw[category_col].astype(str).str.strip().str.upper()
+    else:
+        u["Nasdaq_Category"] = ""
+
+    if pricing_col:
+        u["Pricing_Agent"] = raw[pricing_col].astype(str).str.strip()
+    else:
+        u["Pricing_Agent"] = ""
+
+    # Keep mutual funds. The current NFN directory may use either legacy MF/MS
+    # codes or descriptive values such as "Mutual Fund".
+    if type_col:
+        t = u["Nasdaq_Fund_Type"].str.upper()
+        keep = (
+            t.isin({"MF", "MS"})
+            | t.str.contains("MUTUAL", na=False)
+        )
+        # If the current schema uses a numeric instrument code and the filter
+        # catches nothing, fall back to five-character X-ending mutual-fund
+        # symbols rather than returning an empty tab.
+        if keep.any():
+            u = u[keep].copy()
+
+    u = u[
+        u["Ticker"].notna()
+        & u["Fund_Name"].notna()
+        & (u["Ticker"] != "")
+        & (u["Fund_Name"] != "")
+    ].copy()
+
+    # Mutual-fund symbols are commonly five characters ending in X. This also
+    # helps exclude unrelated NFN instrument types if the current schema changed.
+    symbol_shape = u["Ticker"].str.match(r"^[A-Z0-9]{4,6}X$", na=False)
+    if symbol_shape.any():
+        u = u[symbol_shape].copy()
+
+    u["YahooTicker"] = u["Ticker"].str.replace(".", "-", regex=False)
     u["Exchange"] = "Mutual Fund"
     u["Fund_Type"] = "Mutual Fund"
+    u["Directory_Source"] = source_name
 
-    # Nasdaq supplies the actual Fund Family Name, so use it directly rather than
-    # guessing the institution from the fund name.
-    u["Issuer_Group"] = (
+    # Prefer Nasdaq's actual family/manager field. If a current directory row
+    # lacks it, fall back to our institution-name classifier.
+    guessed_family = u["Fund_Name"].map(
+        lambda x: classify(x, ISSUER_PATTERNS, "Other_or_Unknown")
+    )
+    family = (
         u["Fund_Family_Name"]
-        .fillna("Other_or_Unknown")
+        .fillna("")
         .astype(str)
         .str.strip()
-        .replace("", "Other_or_Unknown")
+    )
+    u["Issuer_Group"] = family.where(
+        (family != "") & (family.str.lower() != "nan"),
+        guessed_family,
     )
 
-    # Use Nasdaq's fixed-income category where available, then fall back to our
-    # name-based categories for the rest.
     u["Sector_Category"] = u.apply(
         lambda row: classify_fund_category(
-            row["Fund_Name"], "Mutual Fund", row.get("Nasdaq_Category", "")
+            row["Fund_Name"],
+            "Mutual Fund",
+            row.get("Nasdaq_Category", ""),
         ),
         axis=1,
     )
+
+    if u.empty:
+        raise ValueError("The Nasdaq directory returned no usable mutual-fund symbols.")
 
     return (
         u.drop_duplicates("YahooTicker")
@@ -687,13 +803,51 @@ with tab_etf:
 with tab_mf:
     try:
         mf_universe = get_mutual_fund_universe()
+        st.caption(
+            "Mutual-fund directory source: "
+            + str(mf_universe["Directory_Source"].iloc[0])
+        )
         render_downloader("Mutual Fund", mf_universe, "mf")
     except Exception as e:
-        st.error(f"Could not load mutual-fund universe: {e}")
-        st.info(
-            "The mutual-fund list is loaded from Nasdaq Trader's official symbol-directory FTP file. "
-            "If this appears again, the FTP service may be temporarily unavailable."
+        st.error(f"Could not automatically load mutual-fund universe: {e}")
+        st.warning(
+            "Automatic directory lookup failed, but you can still download mutual funds "
+            "by ticker below. This fallback keeps the Mutual Funds tab usable even if "
+            "Nasdaq changes its public directory format or endpoint."
         )
+
+        manual = st.text_area(
+            "Mutual fund tickers",
+            value="VFIAX, VTSAX, VBTLX, VTIAX",
+            help="Separate tickers with commas, spaces, or new lines.",
+            key="mf_manual_tickers",
+        )
+        manual_tickers = list(dict.fromkeys([
+            t.strip().upper()
+            for t in manual.replace(",", " ").replace("\n", " ").split()
+            if t.strip()
+        ]))
+
+        manual_rows = []
+        for ticker in manual_tickers:
+            manual_rows.append({
+                "Ticker": ticker,
+                "Fund_Name": ticker,
+                "Fund_Family_Name": "Manual_Selection",
+                "Nasdaq_Fund_Type": "MF",
+                "Nasdaq_Category": "",
+                "Pricing_Agent": "",
+                "YahooTicker": ticker.replace(".", "-"),
+                "Exchange": "Mutual Fund",
+                "Fund_Type": "Mutual Fund",
+                "Directory_Source": "Manual ticker entry",
+                "Issuer_Group": "Manual_Selection",
+                "Sector_Category": "Diversified_Other_Mutual_Fund",
+            })
+
+        if manual_rows:
+            manual_df = pd.DataFrame(manual_rows)
+            render_downloader("Mutual Fund", manual_df, "mf_manual")
 
 st.divider()
 st.markdown(
