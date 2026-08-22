@@ -1,68 +1,43 @@
-# Batched Mutual Fund Downloader
+# ETF + Mutual Fund Downloader
 
-GitHub-ready Streamlit app for downloading mutual-fund historical prices in ZIP batches.
+This app combines the ETF downloader and a mutual-fund downloader into one Streamlit website.
 
-## Files
+## Tabs
 
-- `app.py` — Streamlit web application
-- `requirements.txt` — Python packages for Streamlit Community Cloud
-- `mutual_funds.csv` — mutual-fund database used by the app
+- ETFs
+- Mutual Funds
 
-## Mutual-fund database format
+Both use the same workflow:
+- institution / fund family
+- batch size and batch number
+- recent-period downloads
+- clickable 1, 2, 3, 5, or 10-year historical blocks
+- custom date ranges
+- CSV files inside ZIP downloads
+- sector/category folders
+- combined batch CSV
+- failed-ticker list when needed
 
-`mutual_funds.csv` must contain at least one ticker column named:
+## ETF data intervals
 
-- `symbol`, or
-- `ticker`
+ETFs support:
+- Daily
+- Hourly
+- 30 minute
+- 15 minute
 
-Recommended columns:
+Intraday history depends on upstream Yahoo Finance availability.
 
-```text
-symbol,fund_name,institution,category
-VFIAX,Vanguard 500 Index Fund Admiral Shares,Vanguard,Large Blend
-FXAIX,Fidelity 500 Index Fund,Fidelity,Large Blend
-```
+## Mutual fund data interval
 
-The app also recognizes `fund_family`, `family`, `sponsor`, `issuer`, or
-`fund_company` as the institution/fund-family column.
+Mutual funds generally publish one NAV per trading day, so the Mutual Fund tab intentionally uses Daily data.
 
-Replace the sample CSV with your full mutual-fund database when ready.
+## Updating your existing Streamlit site
 
-## Put it on GitHub
+Replace the current app.py, requirements.txt, and README.md in the ETF-DOWNLOADER GitHub repository with the files from this package.
 
-1. Create a new GitHub repository.
-2. Upload:
-   - `app.py`
-   - `requirements.txt`
-   - `mutual_funds.csv`
-3. Commit the files.
-4. Open Streamlit Community Cloud.
-5. Choose **New app**.
-6. Select your GitHub repository and branch.
-7. Set the main file path to:
-   `app.py`
-8. Deploy.
+Then in GitHub Desktop:
+1. Commit to main
+2. Push origin
 
-When you later update the mutual-fund database, replace `mutual_funds.csv`
-in GitHub and commit it. Streamlit will pick up the repository update.
-
-## What a ZIP contains
-
-For every successful mutual-fund ticker:
-
-- one CSV named after the ticker
-
-It also contains:
-
-- `ALL_MUTUAL_FUNDS_COMBINED.csv`
-- `MANIFEST.csv`
-- `ERRORS.csv` when failures occur
-- `README.txt`
-
-## Important
-
-The app downloads historical data from Yahoo Finance through `yfinance`.
-
-Mutual funds may be renamed, merged, liquidated, converted, or unavailable
-from Yahoo Finance. Failed symbols are written to `ERRORS.csv` rather than
-stopping the whole batch.
+Streamlit should redeploy automatically.
