@@ -81,3 +81,7 @@ The manual ticker fallback remains available if the SEC endpoint is temporarily 
 
 ## One representative share class per fund
 The Mutual Funds tab now defaults to one representative ticker per SEC Series_ID. This removes most duplicate retail, institutional, advisor, and other share classes of the same underlying fund. You can still switch to All share classes if needed. The chosen representative class is for data deduplication only, not an investment recommendation.
+
+
+## Main mutual funds mode
+The Mutual Funds tab now immediately builds a fast one-row-per-SEC-Series_ID list. That is the normal/default mutual-fund universe and removes duplicate share classes. The old all-share-classes option is still available inside an Advanced expander, but it is off by default. The representative ticker is selected deterministically for data deduplication and is not an investment recommendation.

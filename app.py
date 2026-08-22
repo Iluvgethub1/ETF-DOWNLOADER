@@ -226,35 +226,16 @@ def _flatten_sec_fund_record(record):
 
 
 
-def choose_representative_share_class(group):
-    g = group.copy()
-    class_name = g.get("Class_Name", pd.Series("", index=g.index)).fillna("").astype(str)
-    ticker = g["Ticker"].fillna("").astype(str)
-
-    def score_row(idx):
-        name = class_name.loc[idx].lower()
-        score = 100
-        preferences = [
-            ("investor", 0),
-            ("admiral", 5),
-            ("institutional", 10),
-            ("class a", 20),
-            ("class i", 25),
-            ("class n", 30),
-            ("class y", 35),
-            ("class r", 40),
-            ("service", 50),
-        ]
-        for needle, value in preferences:
-            if needle in name:
-                score = min(score, value)
-        return (score, ticker.loc[idx])
-
-    best_idx = min(g.index, key=score_row)
-    return g.loc[[best_idx]]
-
-
 def reduce_to_one_class_per_fund(u):
+    """
+    Keep one ticker for each SEC Series_ID (one underlying fund).
+
+    The SEC ticker file contains one row per share class. Multiple classes of
+    the same fund share the same Series_ID. Dropping duplicates on Series_ID is
+    therefore the fast way to get the main one-row-per-fund universe.
+
+    If Series_ID is ever missing, fall back to CIK + Fund_Name.
+    """
     u = u.copy()
 
     series = (
@@ -263,8 +244,9 @@ def reduce_to_one_class_per_fund(u):
         .astype(str)
         .str.strip()
     )
+
     fallback = (
-        u["Fund_Family_Name"].fillna("").astype(str).str.strip()
+        u.get("CIK", pd.Series("", index=u.index)).fillna("").astype(str).str.strip()
         + " | "
         + u["Fund_Name"].fillna("").astype(str).str.strip()
     )
@@ -274,12 +256,12 @@ def reduce_to_one_class_per_fund(u):
         fallback,
     )
 
-    picked = []
-    for _, group in u.groupby("_Fund_Key", sort=False):
-        picked.append(choose_representative_share_class(group))
+    # Deterministic representative: alphabetically first ticker for each series.
+    # This is a data-deduplication choice, not an investment recommendation.
+    u = u.sort_values(["_Fund_Key", "YahooTicker"])
+    result = u.drop_duplicates("_Fund_Key", keep="first").copy()
 
-    result = pd.concat(picked, ignore_index=True) if picked else u.iloc[0:0].copy()
-    return result.drop(columns=["_Fund_Key"], errors="ignore")
+    return result.drop(columns=["_Fund_Key"], errors="ignore").reset_index(drop=True)
 
 @st.cache_data(ttl=3600)
 def get_mutual_fund_universe():
@@ -758,37 +740,36 @@ with tab_etf:
 with tab_mf:
     try:
         mf_all_classes = get_mutual_fund_universe()
+        mf_main_funds = reduce_to_one_class_per_fund(mf_all_classes)
 
         st.caption(
             "Mutual-fund directory source: "
             + str(mf_all_classes["Directory_Source"].iloc[0])
         )
 
-        class_mode = st.radio(
-            "Mutual-fund share classes",
-            [
-                "One representative share class per fund",
-                "All share classes",
-            ],
-            index=0,
-            key="mf_class_mode",
-            help=(
-                "The default removes duplicate share classes of the same underlying "
-                "fund. Choose All share classes only when you specifically need every class."
-            ),
-        )
-
-        if class_mode == "One representative share class per fund":
-            mf_universe = reduce_to_one_class_per_fund(mf_all_classes)
-            st.success(
-                f"Using {len(mf_universe):,} representative mutual funds instead of "
-                f"{len(mf_all_classes):,} share-class records."
+        use_all_share_classes = False
+        with st.expander("Advanced: all mutual-fund share classes"):
+            st.write(
+                "The normal downloader uses one ticker per underlying SEC fund series. "
+                "Turn this on only if you specifically want every retail, institutional, "
+                "advisor, retirement, and other share class."
             )
-        else:
+            use_all_share_classes = st.checkbox(
+                "Use all share classes",
+                value=False,
+                key="mf_use_all_share_classes",
+            )
+
+        if use_all_share_classes:
             mf_universe = mf_all_classes
             st.warning(
-                f"All share classes selected: {len(mf_universe):,} ticker records. "
-                "Many are different classes of the same underlying fund."
+                f"Advanced mode: {len(mf_universe):,} share-class ticker records."
+            )
+        else:
+            mf_universe = mf_main_funds
+            st.success(
+                f"Main mutual funds: {len(mf_universe):,} underlying funds "
+                f"(reduced from {len(mf_all_classes):,} share-class records)."
             )
 
         render_downloader("Mutual Fund", mf_universe, "mf")
@@ -839,7 +820,7 @@ st.markdown(
     """
 ### How the two downloaders work together
 
-The ETF and Mutual Fund tabs use the same basic workflow:
+The ETF and Mutual Fund tabs use the same basic workflow. Mutual Funds normally use one ticker per underlying SEC fund series:
 
 **Institution → interval/date selection → year blocks/custom dates → batch number → ZIP download.**
 
