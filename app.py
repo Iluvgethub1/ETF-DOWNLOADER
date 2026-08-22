@@ -1,4 +1,5 @@
 import io
+import ftplib
 import math
 import re
 import time
@@ -19,7 +20,8 @@ st.set_page_config(
 
 NASDAQ_LISTED = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
 OTHER_LISTED = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
-MUTUAL_FUNDS_LIST = "https://www.nasdaqtrader.com/dynamic/symdir/mfundslist.txt"
+NASDAQ_FTP_HOST = "ftp.nasdaqtrader.com"
+NASDAQ_FTP_MUTUAL_FUNDS_PATH = "/symboldirectory/mfundslist.txt"
 
 st.title("📦 ETF + Mutual Fund Downloader")
 st.write(
@@ -66,23 +68,48 @@ ISSUER_PATTERNS = [
 ]
 
 SECTOR_PATTERNS = [
-    ("Technology", [r"technology", r"\btech\b", r"semiconductor", r"software", r"cyber", r"cloud", r"artificial intelligence", r"robot"]),
-    ("Financials", [r"financial", r"bank", r"insurance", r"capital markets", r"fintech"]),
-    ("Energy", [r"\benergy\b", r"\boil\b", r"\bgas\b", r"midstream", r"pipeline", r"uranium"]),
-    ("Healthcare", [r"health", r"biotech", r"pharma", r"medical", r"genomic"]),
+    ("Technology", [r"technology", r"\btech\b", r"semiconductor", r"software", r"cyber", r"cloud", r"artificial intelligence", r"\bAI\b", r"robot", r"quantum"]),
+    ("Financials", [r"financial", r"\bbank", r"insurance", r"capital markets", r"fintech", r"broker"]),
+    ("Energy", [r"\benergy\b", r"\boil\b", r"\bgas\b", r"midstream", r"pipeline", r"uranium", r"exploration", r"MLP"]),
+    ("Healthcare", [r"health", r"biotech", r"pharma", r"medical", r"genomic", r"life science"]),
     ("Industrials", [r"industrial", r"aerospace", r"defense", r"transport", r"construction", r"infrastructure", r"machinery"]),
-    ("Consumer_Discretionary", [r"consumer discretionary", r"retail", r"e-commerce", r"travel", r"leisure", r"automotive"]),
-    ("Consumer_Staples", [r"consumer staples", r"food", r"beverage"]),
-    ("Utilities", [r"utilities", r"utility"]),
-    ("Materials", [r"materials", r"metals", r"mining", r"steel", r"copper", r"lithium", r"chemicals", r"timber"]),
-    ("Real_Estate", [r"real estate", r"\bREIT"]),
-    ("Communication_Services", [r"communication services", r"telecom", r"media", r"internet", r"social media"]),
-    ("Fixed_Income", [r"bond", r"treasury", r"municipal", r"muni", r"credit", r"fixed income", r"debt", r"high yield", r"corporate", r"floating rate"]),
-    ("Commodities", [r"gold", r"silver", r"commodity", r"commodities", r"precious metals", r"natural gas", r"crude oil"]),
-    ("International", [r"international", r"emerging market", r"developed market", r"Europe", r"Asia", r"Japan", r"China", r"India", r"Brazil", r"Latin America", r"global"]),
-    ("Broad_Market", [r"S&P 500", r"total stock", r"total market", r"Russell 1000", r"Russell 2000", r"Russell 3000", r"large[- ]cap", r"mid[- ]cap", r"small[- ]cap", r"dividend", r"\bvalue\b", r"\bgrowth\b", r"quality", r"momentum", r"balanced", r"allocation"]),
-    ("Money_Market", [r"money market", r"government money", r"cash reserves"]),
-    ("Thematic_Other", [r"clean energy", r"solar", r"wind", r"water", r"space", r"cannabis", r"blockchain", r"bitcoin", r"crypto", r"metaverse", r"gaming", r"innovation"]),
+    ("Consumer_Discretionary", [r"consumer discretionary", r"retail", r"e-commerce", r"travel", r"leisure", r"automotive", r"restaurant"]),
+    ("Consumer_Staples", [r"consumer staples", r"food", r"beverage", r"grocery", r"agriculture"]),
+    ("Utilities", [r"utilities", r"\butility\b", r"electric power"]),
+    ("Materials", [r"materials", r"metals", r"mining", r"steel", r"copper", r"lithium", r"chemicals", r"timber", r"rare earth"]),
+    ("Real_Estate", [r"real estate", r"\bREIT", r"property"]),
+    ("Communication_Services", [r"communication services", r"telecom", r"media", r"internet", r"social media", r"streaming"]),
+    ("Treasury_Government_Bonds", [r"treasury", r"government bond", r"government securities", r"\bTIPS\b", r"inflation.protected"]),
+    ("Municipal_Bonds", [r"municipal", r"\bmuni\b", r"tax.exempt bond"]),
+    ("Corporate_Bonds", [r"corporate bond", r"investment grade", r"credit opportunities"]),
+    ("High_Yield_Bonds", [r"high yield", r"junk bond"]),
+    ("Short_Term_Bonds", [r"ultra.?short", r"short.?term bond", r"short duration", r"1.?3 year", r"0.?3 month"]),
+    ("Intermediate_Bonds", [r"intermediate.?term", r"intermediate bond", r"3.?10 year"]),
+    ("Long_Term_Bonds", [r"long.?term bond", r"long duration", r"10.?year", r"20.?year", r"30.?year"]),
+    ("Floating_Rate_Bank_Loans", [r"floating rate", r"bank loan", r"senior loan"]),
+    ("Mortgage_Asset_Backed", [r"mortgage", r"mortgage.backed", r"asset.backed", r"\bMBS\b"]),
+    ("International_Bonds", [r"international bond", r"global bond", r"emerging market bond", r"foreign bond"]),
+    ("Fixed_Income_General", [r"\bbond\b", r"fixed income", r"\bdebt\b", r"\bcredit\b"]),
+    ("Money_Market_Cash", [r"money market", r"government money", r"cash reserves", r"liquidity fund", r"treasury money"]),
+    ("Emerging_Markets", [r"emerging market", r"frontier market"]),
+    ("International_Developed", [r"developed market", r"international", r"foreign", r"Europe", r"Asia", r"Japan", r"China", r"India", r"Brazil", r"Latin America", r"Pacific", r"EAFE"]),
+    ("US_Large_Cap", [r"large[- ]cap", r"S&P 500", r"Russell 1000"]),
+    ("US_Mid_Cap", [r"mid[- ]cap", r"S&P MidCap", r"Russell Midcap"]),
+    ("US_Small_Cap", [r"small[- ]cap", r"Russell 2000", r"micro[- ]cap"]),
+    ("Total_Broad_Market", [r"total stock", r"total market", r"Russell 3000", r"broad market", r"composite index"]),
+    ("Growth", [r"\bgrowth\b"]),
+    ("Value", [r"\bvalue\b"]),
+    ("Dividend_Income", [r"dividend", r"equity income", r"income fund"]),
+    ("Quality_Factor", [r"\bquality\b"]),
+    ("Momentum_Factor", [r"\bmomentum\b"]),
+    ("Low_Volatility_Defensive", [r"low volatility", r"minimum volatility", r"defensive"]),
+    ("Balanced_Allocation", [r"balanced", r"allocation", r"target risk", r"multi.?asset", r"asset allocation"]),
+    ("Target_Date_Retirement", [r"target date", r"target retirement", r"retirement \d{4}", r"lifecycle"]),
+    ("Commodities", [r"commodity", r"commodities", r"gold", r"silver", r"precious metals", r"natural gas", r"crude oil"]),
+    ("Currency_Crypto", [r"currency", r"bitcoin", r"ethereum", r"crypto", r"blockchain"]),
+    ("Options_Derivatives", [r"covered call", r"option income", r"buffer", r"defined outcome", r"derivative"]),
+    ("Leveraged_Inverse", [r"leveraged", r"\b2x\b", r"\b3x\b", r"ultra", r"inverse", r"\bshort\b", r"\bbear\b"]),
+    ("Thematic", [r"clean energy", r"solar", r"wind", r"water", r"space", r"cannabis", r"metaverse", r"gaming", r"innovation", r"disruptive"]),
 ]
 
 def classify(text, patterns, default):
@@ -91,6 +118,18 @@ def classify(text, patterns, default):
         if any(re.search(p, text, flags=re.IGNORECASE) for p in pats):
             return label
     return default
+
+def classify_fund_category(name, fund_type="ETF", nasdaq_category=""):
+    name = str(name or "")
+    cat = str(nasdaq_category or "").upper().strip()
+    if cat == "D":
+        return "Fixed_Income_General"
+    result = classify(name, SECTOR_PATTERNS, "")
+    if result:
+        return result
+    if str(fund_type).lower().startswith("mutual"):
+        return "Diversified_Other_Mutual_Fund"
+    return "Diversified_Other_ETF"
 
 def safe_name(value):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("_") or "Unknown"
@@ -122,35 +161,147 @@ def get_etf_universe():
     u["YahooTicker"] = u["Ticker"].astype(str).str.replace(".", "-", regex=False)
     u["Fund_Type"] = "ETF"
     u["Issuer_Group"] = u["Fund_Name"].map(lambda x: classify(x, ISSUER_PATTERNS, "Other_or_Unknown"))
-    u["Sector_Category"] = u["Fund_Name"].map(lambda x: classify(x, SECTOR_PATTERNS, "Unclassified"))
+    u["Sector_Category"] = u["Fund_Name"].map(lambda x: classify_fund_category(x, "ETF"))
     return u.drop_duplicates("YahooTicker").sort_values(["Issuer_Group", "YahooTicker"]).reset_index(drop=True)
+
+def fetch_nasdaq_mutual_fund_text():
+    """
+    Nasdaq's current symbol-directory page documents mfundslist.txt as an FTP file.
+    Fetch it directly from the Nasdaq Trader FTP server instead of the old HTTP URL.
+    """
+    buffer = io.BytesIO()
+
+    ftp = ftplib.FTP(NASDAQ_FTP_HOST, timeout=30)
+    try:
+        ftp.login()
+        ftp.retrbinary(
+            f"RETR {NASDAQ_FTP_MUTUAL_FUNDS_PATH}",
+            buffer.write,
+        )
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+
+    raw = buffer.getvalue()
+
+    # Nasdaq's symbol-directory files are ASCII/Windows text. utf-8-sig handles
+    # a BOM if one is present; latin-1 fallback avoids parser crashes on odd bytes.
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
+def parse_mutual_fund_directory(raw_text):
+    """
+    Parse the pipe-delimited mfundslist.txt defensively.
+    Expected fields:
+    Fund Symbol | Fund Name | Fund Family Name | Type | Category | Pricing Agent
+
+    We intentionally parse line-by-line instead of using pandas.read_csv so an
+    odd footer or malformed line cannot break the whole mutual-fund tab.
+    """
+    records = []
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        if line.startswith("File Creation Time"):
+            continue
+
+        parts = [p.strip() for p in line.split("|")]
+
+        # Header line.
+        if parts and parts[0].lower() == "fund symbol":
+            continue
+
+        # We need at least symbol, name and family.
+        if len(parts) < 3:
+            continue
+
+        # If a line contains extra delimiters, preserve the first six documented
+        # fields and ignore anything after them.
+        parts = parts[:6] + [""] * max(0, 6 - len(parts))
+
+        symbol, fund_name, family, fund_type, category, pricing_agent = parts[:6]
+
+        symbol = symbol.strip().upper()
+        fund_name = fund_name.strip()
+        family = family.strip()
+        fund_type = fund_type.strip().upper()
+        category = category.strip().upper()
+
+        if not symbol or not fund_name:
+            continue
+
+        # Keep actual mutual funds / supplemental mutual funds. Money-market
+        # funds can be added later as a separate product if desired.
+        if fund_type not in {"MF", "MS"}:
+            continue
+
+        records.append(
+            {
+                "Ticker": symbol,
+                "Fund_Name": fund_name,
+                "Fund_Family_Name": family or "Other_or_Unknown",
+                "Nasdaq_Fund_Type": fund_type,
+                "Nasdaq_Category": category,
+                "Pricing_Agent": pricing_agent,
+            }
+        )
+
+    if not records:
+        raise ValueError(
+            "Nasdaq mutual-fund directory was reached, but no mutual-fund records could be parsed."
+        )
+
+    return pd.DataFrame(records)
+
 
 @st.cache_data(ttl=3600)
 def get_mutual_fund_universe():
-    mf = read_pipe(MUTUAL_FUNDS_LIST)
+    raw_text = fetch_nasdaq_mutual_fund_text()
+    u = parse_mutual_fund_directory(raw_text)
 
-    # Nasdaq's mutual-fund directory field names can vary slightly.
-    symbol_candidates = ["Fund Symbol", "Symbol"]
-    name_candidates = ["Fund Name", "Security Name", "Name"]
-
-    symbol_col = next((c for c in symbol_candidates if c in mf.columns), None)
-    name_col = next((c for c in name_candidates if c in mf.columns), None)
-
-    if symbol_col is None or name_col is None:
-        raise ValueError(
-            "Could not identify mutual-fund symbol/name columns in the Nasdaq mutual-fund directory."
-        )
-
-    u = mf[[symbol_col, name_col]].copy()
-    u = u.rename(columns={symbol_col: "Ticker", name_col: "Fund_Name"})
-    u = u[u["Ticker"].notna() & u["Fund_Name"].notna()]
-    u["Ticker"] = u["Ticker"].astype(str).str.strip().str.upper()
-    u["YahooTicker"] = u["Ticker"].str.replace(".", "-", regex=False)
+    u["YahooTicker"] = (
+        u["Ticker"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .str.replace(".", "-", regex=False)
+    )
     u["Exchange"] = "Mutual Fund"
     u["Fund_Type"] = "Mutual Fund"
-    u["Issuer_Group"] = u["Fund_Name"].map(lambda x: classify(x, ISSUER_PATTERNS, "Other_or_Unknown"))
-    u["Sector_Category"] = u["Fund_Name"].map(lambda x: classify(x, SECTOR_PATTERNS, "Unclassified"))
-    return u.drop_duplicates("YahooTicker").sort_values(["Issuer_Group", "YahooTicker"]).reset_index(drop=True)
+
+    # Nasdaq supplies the actual Fund Family Name, so use it directly rather than
+    # guessing the institution from the fund name.
+    u["Issuer_Group"] = (
+        u["Fund_Family_Name"]
+        .fillna("Other_or_Unknown")
+        .astype(str)
+        .str.strip()
+        .replace("", "Other_or_Unknown")
+    )
+
+    # Use Nasdaq's fixed-income category where available, then fall back to our
+    # name-based categories for the rest.
+    u["Sector_Category"] = u.apply(
+        lambda row: classify_fund_category(
+            row["Fund_Name"], "Mutual Fund", row.get("Nasdaq_Category", "")
+        ),
+        axis=1,
+    )
+
+    return (
+        u.drop_duplicates("YahooTicker")
+        .sort_values(["Issuer_Group", "YahooTicker"])
+        .reset_index(drop=True)
+    )
 
 def time_selector(prefix, fund_type):
     if fund_type == "ETF":
@@ -540,8 +691,8 @@ with tab_mf:
     except Exception as e:
         st.error(f"Could not load mutual-fund universe: {e}")
         st.info(
-            "If the Nasdaq mutual-fund directory is temporarily unavailable, "
-            "try refreshing the app later."
+            "The mutual-fund list is loaded from Nasdaq Trader's official symbol-directory FTP file. "
+            "If this appears again, the FTP service may be temporarily unavailable."
         )
 
 st.divider()

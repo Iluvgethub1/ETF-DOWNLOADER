@@ -41,3 +41,16 @@ Then in GitHub Desktop:
 2. Push origin
 
 Streamlit should redeploy automatically.
+
+
+## Mutual-fund directory fix
+
+This build no longer tries to read the retired/broken Nasdaq HTTP mutual-fund URL.
+
+It retrieves `mfundslist.txt` from Nasdaq Trader's official symbol-directory FTP service and parses it line-by-line so malformed/footer lines do not crash the Mutual Funds tab.
+
+It also uses Nasdaq's own **Fund Family Name** field for the mutual-fund institution/fund-family selector instead of trying to guess the family from the fund name.
+
+
+## Expanded categories for BOTH tabs
+ETFs and mutual funds now use the same expanded category engine. Exports include the Sector_Category column and By_Sector folders for equity sectors, bond types/durations, cash, geography, size/style, allocation/target-date, commodities, crypto/currency, derivatives, leveraged/inverse, and thematic products. Unmatched products receive a Diversified_Other label instead of Unclassified.
