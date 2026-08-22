@@ -77,3 +77,7 @@ That SEC file is intended for fund CIK, series, class and ticker associations.
 Historical NAV/price downloads still come from Yahoo Finance through yfinance.
 
 The manual ticker fallback remains available if the SEC endpoint is temporarily unavailable.
+
+
+## One representative share class per fund
+The Mutual Funds tab now defaults to one representative ticker per SEC Series_ID. This removes most duplicate retail, institutional, advisor, and other share classes of the same underlying fund. You can still switch to All share classes if needed. The chosen representative class is for data deduplication only, not an investment recommendation.

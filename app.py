@@ -217,12 +217,69 @@ def _flatten_sec_fund_record(record):
     return {
         "Ticker": ticker,
         "Fund_Name": fund_name,
+        "Class_Name": class_name,
         "Fund_Family_Name": company_name or "Other_or_Unknown",
         "CIK": str(cik),
         "Series_ID": str(series_id),
         "Class_ID": str(class_id),
     }
 
+
+
+def choose_representative_share_class(group):
+    g = group.copy()
+    class_name = g.get("Class_Name", pd.Series("", index=g.index)).fillna("").astype(str)
+    ticker = g["Ticker"].fillna("").astype(str)
+
+    def score_row(idx):
+        name = class_name.loc[idx].lower()
+        score = 100
+        preferences = [
+            ("investor", 0),
+            ("admiral", 5),
+            ("institutional", 10),
+            ("class a", 20),
+            ("class i", 25),
+            ("class n", 30),
+            ("class y", 35),
+            ("class r", 40),
+            ("service", 50),
+        ]
+        for needle, value in preferences:
+            if needle in name:
+                score = min(score, value)
+        return (score, ticker.loc[idx])
+
+    best_idx = min(g.index, key=score_row)
+    return g.loc[[best_idx]]
+
+
+def reduce_to_one_class_per_fund(u):
+    u = u.copy()
+
+    series = (
+        u.get("Series_ID", pd.Series("", index=u.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    fallback = (
+        u["Fund_Family_Name"].fillna("").astype(str).str.strip()
+        + " | "
+        + u["Fund_Name"].fillna("").astype(str).str.strip()
+    )
+
+    u["_Fund_Key"] = series.where(
+        (series != "") & (series.str.lower() != "nan"),
+        fallback,
+    )
+
+    picked = []
+    for _, group in u.groupby("_Fund_Key", sort=False):
+        picked.append(choose_representative_share_class(group))
+
+    result = pd.concat(picked, ignore_index=True) if picked else u.iloc[0:0].copy()
+    return result.drop(columns=["_Fund_Key"], errors="ignore")
 
 @st.cache_data(ttl=3600)
 def get_mutual_fund_universe():
@@ -310,11 +367,12 @@ def get_mutual_fund_universe():
         lambda x: classify_fund_category(x, "Mutual Fund", "")
     )
 
-    return (
+    u = (
         u.drop_duplicates("YahooTicker")
         .sort_values(["Issuer_Group", "YahooTicker"])
         .reset_index(drop=True)
     )
+    return u
 
 def time_selector(prefix, fund_type):
     if fund_type == "ETF":
@@ -699,17 +757,47 @@ with tab_etf:
 
 with tab_mf:
     try:
-        mf_universe = get_mutual_fund_universe()
+        mf_all_classes = get_mutual_fund_universe()
+
         st.caption(
             "Mutual-fund directory source: "
-            + str(mf_universe["Directory_Source"].iloc[0])
+            + str(mf_all_classes["Directory_Source"].iloc[0])
         )
+
+        class_mode = st.radio(
+            "Mutual-fund share classes",
+            [
+                "One representative share class per fund",
+                "All share classes",
+            ],
+            index=0,
+            key="mf_class_mode",
+            help=(
+                "The default removes duplicate share classes of the same underlying "
+                "fund. Choose All share classes only when you specifically need every class."
+            ),
+        )
+
+        if class_mode == "One representative share class per fund":
+            mf_universe = reduce_to_one_class_per_fund(mf_all_classes)
+            st.success(
+                f"Using {len(mf_universe):,} representative mutual funds instead of "
+                f"{len(mf_all_classes):,} share-class records."
+            )
+        else:
+            mf_universe = mf_all_classes
+            st.warning(
+                f"All share classes selected: {len(mf_universe):,} ticker records. "
+                "Many are different classes of the same underlying fund."
+            )
+
         render_downloader("Mutual Fund", mf_universe, "mf")
+
     except Exception as e:
         st.error(f"Could not automatically load mutual-fund universe: {e}")
         st.warning(
             "Automatic SEC mutual-fund ticker lookup failed, but you can still download "
-            "mutual funds by ticker below. The manual fallback keeps the tab usable."
+            "mutual funds by ticker below."
         )
 
         manual = st.text_area(
@@ -729,10 +817,11 @@ with tab_mf:
             manual_rows.append({
                 "Ticker": ticker,
                 "Fund_Name": ticker,
+                "Class_Name": "",
                 "Fund_Family_Name": "Manual_Selection",
-                "Nasdaq_Fund_Type": "MF",
-                "Nasdaq_Category": "",
-                "Pricing_Agent": "",
+                "CIK": "",
+                "Series_ID": "",
+                "Class_ID": "",
                 "YahooTicker": ticker.replace(".", "-"),
                 "Exchange": "Mutual Fund",
                 "Fund_Type": "Mutual Fund",
