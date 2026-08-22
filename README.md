@@ -66,3 +66,14 @@ and historical field names because Nasdaq's NFN directory schema has evolved.
 
 There is also a manual mutual-fund ticker fallback. If Nasdaq changes the public directory again,
 you can still enter mutual-fund symbols and use the same year-block, batch, CSV and ZIP workflow.
+
+
+## SEC mutual-fund directory source
+
+This build uses the SEC's public `company_tickers_mf.json` file for mutual-fund
+ticker/series/class associations instead of Nasdaq's FTP/NFN endpoints.
+
+That SEC file is intended for fund CIK, series, class and ticker associations.
+Historical NAV/price downloads still come from Yahoo Finance through yfinance.
+
+The manual ticker fallback remains available if the SEC endpoint is temporarily unavailable.

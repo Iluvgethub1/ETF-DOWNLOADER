@@ -19,8 +19,7 @@ st.set_page_config(
 
 NASDAQ_LISTED = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
 OTHER_LISTED = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
-NFN_DIRECTORY_API = "https://api.nfn.nasdaq.com/servicecall/InstrumentDirectory.ashx"
-LEGACY_MUTUAL_FUNDS_HTTP = "https://www.nasdaqtrader.com/dynamic/SymDir/mfundslist.txt"
+SEC_MUTUAL_FUND_TICKERS = "https://www.sec.gov/files/company_tickers_mf.json"
 
 st.title("📦 ETF + Mutual Fund Downloader")
 st.write(
@@ -164,254 +163,152 @@ def get_etf_universe():
     return u.drop_duplicates("YahooTicker").sort_values(["Issuer_Group", "YahooTicker"]).reset_index(drop=True)
 
 
-def _normalize_column_name(value):
-    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
 
-def _find_column(columns, candidates):
-    normalized = {_normalize_column_name(c): c for c in columns}
-    for candidate in candidates:
-        key = _normalize_column_name(candidate)
-        if key in normalized:
-            return normalized[key]
-    return None
-
-def _clean_directory_frame(df):
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    # Strip whitespace from headers and text values.
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    for c in df.columns:
-        if df[c].dtype == object:
-            df[c] = df[c].astype(str).str.strip()
-
-    # Drop rows that are clearly file footers / empty records.
-    first_col = df.columns[0]
-    df = df[
-        ~df[first_col].astype(str).str.startswith("File Creation Time", na=False)
-    ]
-    return df
-
-def fetch_nfn_directory():
+def _flatten_sec_fund_record(record):
     """
-    Preferred source: Nasdaq Fund Network's documented InstrumentDirectory
-    web service. It supports CSV via the Accept header and does not require us
-    to depend on the legacy FTP path that returned error 550.
+    SEC's company_tickers_mf.json can expose fund ticker associations as
+    dictionaries with varying key names over time. Normalize the fields we need.
     """
-    errors = []
+    if not isinstance(record, dict):
+        return None
 
-    # 1) Current NFN web service.
-    try:
-        response = requests.get(
-            NFN_DIRECTORY_API,
-            headers={
-                "Accept": "text/csv",
-                "User-Agent": "Mozilla/5.0 ETF-Mutual-Fund-Downloader",
-            },
-            timeout=45,
-        )
-        response.raise_for_status()
+    # Accept several likely key names defensively.
+    ticker = (
+        record.get("ticker")
+        or record.get("class_ticker")
+        or record.get("classTicker")
+        or record.get("symbol")
+        or ""
+    )
+    series_name = (
+        record.get("series_name")
+        or record.get("seriesName")
+        or record.get("series")
+        or ""
+    )
+    class_name = (
+        record.get("class_name")
+        or record.get("className")
+        or record.get("class")
+        or ""
+    )
+    company_name = (
+        record.get("name")
+        or record.get("company_name")
+        or record.get("companyName")
+        or record.get("investment_company_name")
+        or ""
+    )
+    cik = record.get("cik") or record.get("cik_str") or record.get("CIK") or ""
+    series_id = record.get("series_id") or record.get("seriesId") or ""
+    class_id = record.get("class_id") or record.get("classId") or ""
 
-        content_type = response.headers.get("content-type", "").lower()
-        body = response.text.lstrip()
+    ticker = str(ticker).strip().upper()
+    series_name = str(series_name).strip()
+    class_name = str(class_name).strip()
+    company_name = str(company_name).strip()
 
-        # Reject obvious HTML/error pages even if status is 200.
-        if "<html" in body[:300].lower() or "<!doctype" in body[:300].lower():
-            raise ValueError("NFN web service returned an HTML page instead of CSV.")
+    if not ticker:
+        return None
 
-        df = pd.read_csv(
-            io.StringIO(response.text),
-            dtype=str,
-            engine="python",
-            on_bad_lines="skip",
-        )
-        df = _clean_directory_frame(df)
-        if not df.empty and len(df.columns) >= 3:
-            return df, "Nasdaq NFN web service"
-        raise ValueError("NFN web service returned no usable directory rows.")
-    except Exception as e:
-        errors.append(f"NFN web service: {e}")
+    # Prefer the series name as the investment product name; otherwise use class/company.
+    fund_name = series_name or class_name or company_name or ticker
 
-    # 2) Legacy Nasdaq web-hosted pipe file as fallback.
-    try:
-        response = requests.get(
-            LEGACY_MUTUAL_FUNDS_HTTP,
-            headers={"User-Agent": "Mozilla/5.0 ETF-Mutual-Fund-Downloader"},
-            timeout=45,
-        )
-        response.raise_for_status()
+    return {
+        "Ticker": ticker,
+        "Fund_Name": fund_name,
+        "Fund_Family_Name": company_name or "Other_or_Unknown",
+        "CIK": str(cik),
+        "Series_ID": str(series_id),
+        "Class_ID": str(class_id),
+    }
 
-        body = response.text.lstrip()
-        if "<html" in body[:300].lower() or "<!doctype" in body[:300].lower():
-            raise ValueError("Legacy Nasdaq URL returned HTML instead of the directory.")
-
-        # Parse line-by-line so one malformed line cannot break the page.
-        rows = []
-        header = None
-        for raw_line in response.text.splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("File Creation Time"):
-                continue
-            parts = [p.strip() for p in line.split("|")]
-            if header is None:
-                header = parts
-                continue
-            if len(parts) < 3:
-                continue
-            if len(parts) < len(header):
-                parts += [""] * (len(header) - len(parts))
-            rows.append(parts[:len(header)])
-
-        if not header or not rows:
-            raise ValueError("Legacy Nasdaq directory had no usable rows.")
-
-        df = pd.DataFrame(rows, columns=header)
-        df = _clean_directory_frame(df)
-        return df, "Nasdaq legacy web directory"
-    except Exception as e:
-        errors.append(f"Legacy Nasdaq directory: {e}")
-
-    raise RuntimeError(" | ".join(errors))
 
 @st.cache_data(ttl=3600)
 def get_mutual_fund_universe():
-    raw, source_name = fetch_nfn_directory()
+    """
+    Use the SEC's public mutual-fund ticker association file instead of Nasdaq's
+    protected/unstable mutual-fund directory endpoints.
+    """
+    response = requests.get(
+        SEC_MUTUAL_FUND_TICKERS,
+        headers={
+            "User-Agent": "ETF-Mutual-Fund-Downloader/1.0 contact@example.com",
+            "Accept": "application/json",
+        },
+        timeout=45,
+    )
+    response.raise_for_status()
+    payload = response.json()
 
-    # Current NFN files have evolved over time, so accept several documented /
-    # historical column names rather than hard-coding one schema.
-    symbol_col = _find_column(
-        raw.columns,
-        [
-            "NFN Symbol", "Fund Symbol", "Symbol", "Instrument Symbol",
-            "InstrumentSymbol", "Ticker"
-        ],
-    )
-    name_col = _find_column(
-        raw.columns,
-        [
-            "Instrument Name", "Fund Name", "Security Name", "Name",
-            "InstrumentName"
-        ],
-    )
-    family_col = _find_column(
-        raw.columns,
-        [
-            "Fund Family Name", "Fund Family", "Issuer Manager",
-            "Issuer/Manager", "Issuer Manager Name", "Manager Name",
-            "FundFamilyName"
-        ],
-    )
-    type_col = _find_column(
-        raw.columns,
-        [
-            "Instrument Type", "Fund Type", "Type", "InstrumentType"
-        ],
-    )
-    category_col = _find_column(
-        raw.columns,
-        [
-            "Instrument Code", "Fund Code", "Category", "Fund Category",
-            "InstrumentCode"
-        ],
-    )
-    pricing_col = _find_column(
-        raw.columns,
-        [
-            "Pricing Agent", "PricingAgent"
-        ],
-    )
+    records = []
 
-    if symbol_col is None or name_col is None:
+    # Handle common SEC JSON layouts:
+    # 1) {"data": [...]}
+    # 2) {"0": {...}, "1": {...}}
+    # 3) simple [...]
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        iterable = payload["data"]
+    elif isinstance(payload, dict):
+        iterable = list(payload.values())
+    elif isinstance(payload, list):
+        iterable = payload
+    else:
+        raise ValueError("SEC mutual-fund ticker file returned an unexpected JSON structure.")
+
+    # Some SEC files may use compact array rows with a "fields" definition.
+    fields = payload.get("fields") if isinstance(payload, dict) else None
+    if fields and isinstance(fields, list):
+        expanded = []
+        for item in iterable:
+            if isinstance(item, list):
+                expanded.append(dict(zip(fields, item)))
+            else:
+                expanded.append(item)
+        iterable = expanded
+
+    for item in iterable:
+        normalized = _flatten_sec_fund_record(item)
+        if normalized:
+            records.append(normalized)
+
+    if not records:
         raise ValueError(
-            "Nasdaq directory loaded, but the symbol/name fields could not be identified. "
-            f"Available columns: {', '.join(map(str, raw.columns[:20]))}"
+            "SEC mutual-fund ticker file was reached, but no ticker records could be parsed."
         )
 
-    u = pd.DataFrame({
-        "Ticker": raw[symbol_col].astype(str).str.strip().str.upper(),
-        "Fund_Name": raw[name_col].astype(str).str.strip(),
-    })
+    u = pd.DataFrame(records)
 
-    if family_col:
-        u["Fund_Family_Name"] = raw[family_col].astype(str).str.strip()
-    else:
-        u["Fund_Family_Name"] = ""
+    # Mutual-fund tickers commonly end in X. Keep the SEC-provided records but
+    # prefer that familiar shape when it exists in the data.
+    shaped = u["Ticker"].astype(str).str.match(r"^[A-Z0-9]{4,6}X$", na=False)
+    if shaped.any():
+        u = u[shaped].copy()
 
-    if type_col:
-        u["Nasdaq_Fund_Type"] = raw[type_col].astype(str).str.strip().str.upper()
-    else:
-        u["Nasdaq_Fund_Type"] = ""
-
-    if category_col:
-        u["Nasdaq_Category"] = raw[category_col].astype(str).str.strip().str.upper()
-    else:
-        u["Nasdaq_Category"] = ""
-
-    if pricing_col:
-        u["Pricing_Agent"] = raw[pricing_col].astype(str).str.strip()
-    else:
-        u["Pricing_Agent"] = ""
-
-    # Keep mutual funds. The current NFN directory may use either legacy MF/MS
-    # codes or descriptive values such as "Mutual Fund".
-    if type_col:
-        t = u["Nasdaq_Fund_Type"].str.upper()
-        keep = (
-            t.isin({"MF", "MS"})
-            | t.str.contains("MUTUAL", na=False)
-        )
-        # If the current schema uses a numeric instrument code and the filter
-        # catches nothing, fall back to five-character X-ending mutual-fund
-        # symbols rather than returning an empty tab.
-        if keep.any():
-            u = u[keep].copy()
-
-    u = u[
-        u["Ticker"].notna()
-        & u["Fund_Name"].notna()
-        & (u["Ticker"] != "")
-        & (u["Fund_Name"] != "")
-    ].copy()
-
-    # Mutual-fund symbols are commonly five characters ending in X. This also
-    # helps exclude unrelated NFN instrument types if the current schema changed.
-    symbol_shape = u["Ticker"].str.match(r"^[A-Z0-9]{4,6}X$", na=False)
-    if symbol_shape.any():
-        u = u[symbol_shape].copy()
-
-    u["YahooTicker"] = u["Ticker"].str.replace(".", "-", regex=False)
+    u["YahooTicker"] = (
+        u["Ticker"].astype(str).str.strip().str.upper().str.replace(".", "-", regex=False)
+    )
     u["Exchange"] = "Mutual Fund"
     u["Fund_Type"] = "Mutual Fund"
-    u["Directory_Source"] = source_name
+    u["Directory_Source"] = "SEC company_tickers_mf.json"
 
-    # Prefer Nasdaq's actual family/manager field. If a current directory row
-    # lacks it, fall back to our institution-name classifier.
-    guessed_family = u["Fund_Name"].map(
-        lambda x: classify(x, ISSUER_PATTERNS, "Other_or_Unknown")
-    )
     family = (
         u["Fund_Family_Name"]
         .fillna("")
         .astype(str)
         .str.strip()
     )
+    guessed_family = u["Fund_Name"].map(
+        lambda x: classify(x, ISSUER_PATTERNS, "Other_or_Unknown")
+    )
     u["Issuer_Group"] = family.where(
         (family != "") & (family.str.lower() != "nan"),
         guessed_family,
     )
 
-    u["Sector_Category"] = u.apply(
-        lambda row: classify_fund_category(
-            row["Fund_Name"],
-            "Mutual Fund",
-            row.get("Nasdaq_Category", ""),
-        ),
-        axis=1,
+    u["Sector_Category"] = u["Fund_Name"].map(
+        lambda x: classify_fund_category(x, "Mutual Fund", "")
     )
-
-    if u.empty:
-        raise ValueError("The Nasdaq directory returned no usable mutual-fund symbols.")
 
     return (
         u.drop_duplicates("YahooTicker")
@@ -811,9 +708,8 @@ with tab_mf:
     except Exception as e:
         st.error(f"Could not automatically load mutual-fund universe: {e}")
         st.warning(
-            "Automatic directory lookup failed, but you can still download mutual funds "
-            "by ticker below. This fallback keeps the Mutual Funds tab usable even if "
-            "Nasdaq changes its public directory format or endpoint."
+            "Automatic SEC mutual-fund ticker lookup failed, but you can still download "
+            "mutual funds by ticker below. The manual fallback keeps the tab usable."
         )
 
         manual = st.text_area(
